@@ -1,0 +1,8 @@
+# Distributed Prediction Market Server
+### By Matthew Daly and Andrew Myers
+## Goal:
+ - Build client nodes that authenticate users, listen for orders, and then append their data to the Aurora DSQL tables as necessary.
+ - Matchmaker nodes which read orders from the Aurora DB and find matches, and then append them.
+ - Aurora is single writer, with read duplicates, so it will handle the atomicity of the orders and matches. 
+    - we must construct transactions that require balance be above the price of the order, among other things.
+
