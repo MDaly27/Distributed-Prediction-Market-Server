@@ -9,7 +9,7 @@
 -- 1. Accounts
 -- =========================================================
 
-CREATE TABLE accounts (
+CREATE TABLE IF NOT EXISTS accounts (
     account_id UUID PRIMARY KEY,
     external_user_id TEXT UNIQUE,
     username TEXT UNIQUE,
@@ -22,14 +22,14 @@ CREATE TABLE accounts (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX ASYNC accounts_status_idx ON accounts(status);
+CREATE INDEX ASYNC IF NOT EXISTS accounts_status_idx ON accounts(status);
 
 
 -- =========================================================
 -- 2. Markets
 -- =========================================================
 
-CREATE TABLE markets (
+CREATE TABLE IF NOT EXISTS markets (
     market_id UUID PRIMARY KEY,
     slug TEXT UNIQUE NOT NULL,
     title TEXT NOT NULL,
@@ -53,8 +53,8 @@ CREATE TABLE markets (
     CHECK (max_price_cents <= 100)
 );
 
-CREATE INDEX ASYNC markets_status_idx ON markets(status);
-CREATE INDEX ASYNC markets_close_time_idx ON markets(close_time);
+CREATE INDEX ASYNC IF NOT EXISTS markets_status_idx ON markets(status);
+CREATE INDEX ASYNC IF NOT EXISTS markets_close_time_idx ON markets(close_time);
 
 
 -- =========================================================
@@ -62,7 +62,7 @@ CREATE INDEX ASYNC markets_close_time_idx ON markets(close_time);
 -- One row per resolved/cancelled market outcome
 -- =========================================================
 
-CREATE TABLE market_resolutions (
+CREATE TABLE IF NOT EXISTS market_resolutions (
     resolution_id UUID PRIMARY KEY,
     market_id UUID NOT NULL UNIQUE,
 
@@ -79,7 +79,7 @@ CREATE TABLE market_resolutions (
 -- Snapshot table for fast reads
 -- =========================================================
 
-CREATE TABLE positions (
+CREATE TABLE IF NOT EXISTS positions (
     account_id UUID NOT NULL,
     market_id UUID NOT NULL,
 
@@ -95,7 +95,7 @@ CREATE TABLE positions (
     PRIMARY KEY (account_id, market_id)
 );
 
-CREATE INDEX ASYNC positions_market_idx ON positions(market_id);
+CREATE INDEX ASYNC IF NOT EXISTS positions_market_idx ON positions(market_id);
 
 
 -- =========================================================
@@ -104,7 +104,7 @@ CREATE INDEX ASYNC positions_market_idx ON positions(market_id);
 -- YES / NO side for prediction markets
 -- =========================================================
 
-CREATE TABLE orders (
+CREATE TABLE IF NOT EXISTS orders (
     request_id UUID PRIMARY KEY,
 
     global_seq BIGINT GENERATED ALWAYS AS IDENTITY (
@@ -138,11 +138,11 @@ CREATE TABLE orders (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX ASYNC orders_global_seq_uq ON orders(global_seq);
-CREATE INDEX ASYNC orders_market_seq_idx ON orders(market_id, global_seq);
-CREATE INDEX ASYNC orders_account_seq_idx ON orders(account_id, global_seq);
-CREATE INDEX ASYNC orders_market_status_price_idx ON orders(market_id, status, price_cents);
-CREATE INDEX ASYNC orders_market_side_status_price_idx ON orders(market_id, side, status, price_cents);
+CREATE UNIQUE INDEX ASYNC IF NOT EXISTS orders_global_seq_uq ON orders(global_seq);
+CREATE INDEX ASYNC IF NOT EXISTS orders_market_seq_idx ON orders(market_id, global_seq);
+CREATE INDEX ASYNC IF NOT EXISTS orders_account_seq_idx ON orders(account_id, global_seq);
+CREATE INDEX ASYNC IF NOT EXISTS orders_market_status_price_idx ON orders(market_id, status, price_cents);
+CREATE INDEX ASYNC IF NOT EXISTS orders_market_side_status_price_idx ON orders(market_id, side, status, price_cents);
 
 
 -- =========================================================
@@ -150,7 +150,7 @@ CREATE INDEX ASYNC orders_market_side_status_price_idx ON orders(market_id, side
 -- Separate audit/event table for cancellation requests
 -- =========================================================
 
-CREATE TABLE order_cancels (
+CREATE TABLE IF NOT EXISTS order_cancels (
     cancel_id UUID PRIMARY KEY,
     order_id UUID NOT NULL,
     account_id UUID NOT NULL,
@@ -165,8 +165,8 @@ CREATE TABLE order_cancels (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX ASYNC order_cancels_seq_uq ON order_cancels(cancel_seq);
-CREATE INDEX ASYNC order_cancels_order_idx ON order_cancels(order_id);
+CREATE UNIQUE INDEX ASYNC IF NOT EXISTS order_cancels_seq_uq ON order_cancels(cancel_seq);
+CREATE INDEX ASYNC IF NOT EXISTS order_cancels_order_idx ON order_cancels(order_id);
 
 
 -- =========================================================
@@ -174,7 +174,7 @@ CREATE INDEX ASYNC order_cancels_order_idx ON order_cancels(order_id);
 -- One row per execution
 -- =========================================================
 
-CREATE TABLE trades (
+CREATE TABLE IF NOT EXISTS trades (
     trade_id UUID PRIMARY KEY,
 
     match_seq BIGINT GENERATED ALWAYS AS IDENTITY (
@@ -194,10 +194,10 @@ CREATE TABLE trades (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX ASYNC trades_match_seq_uq ON trades(match_seq);
-CREATE INDEX ASYNC trades_market_seq_idx ON trades(market_id, match_seq);
-CREATE INDEX ASYNC trades_resting_order_idx ON trades(resting_order_id);
-CREATE INDEX ASYNC trades_aggressing_order_idx ON trades(aggressing_order_id);
+CREATE UNIQUE INDEX ASYNC IF NOT EXISTS trades_match_seq_uq ON trades(match_seq);
+CREATE INDEX ASYNC IF NOT EXISTS trades_market_seq_idx ON trades(market_id, match_seq);
+CREATE INDEX ASYNC IF NOT EXISTS trades_resting_order_idx ON trades(resting_order_id);
+CREATE INDEX ASYNC IF NOT EXISTS trades_aggressing_order_idx ON trades(aggressing_order_id);
 
 
 -- =========================================================
@@ -205,7 +205,7 @@ CREATE INDEX ASYNC trades_aggressing_order_idx ON trades(aggressing_order_id);
 -- Useful to explicitly record who got what in each trade
 -- =========================================================
 
-CREATE TABLE trade_parties (
+CREATE TABLE IF NOT EXISTS trade_parties (
     trade_id UUID NOT NULL,
     account_id UUID NOT NULL,
 
@@ -220,7 +220,7 @@ CREATE TABLE trade_parties (
     PRIMARY KEY (trade_id, account_id)
 );
 
-CREATE INDEX ASYNC trade_parties_account_idx ON trade_parties(account_id);
+CREATE INDEX ASYNC IF NOT EXISTS trade_parties_account_idx ON trade_parties(account_id);
 
 
 -- =========================================================
@@ -228,7 +228,7 @@ CREATE INDEX ASYNC trade_parties_account_idx ON trade_parties(account_id);
 -- Deposits / withdrawals with external payment refs
 -- =========================================================
 
-CREATE TABLE cash_transactions (
+CREATE TABLE IF NOT EXISTS cash_transactions (
     cash_txn_id UUID PRIMARY KEY,
     account_id UUID NOT NULL,
 
@@ -246,8 +246,8 @@ CREATE TABLE cash_transactions (
     completed_at TIMESTAMPTZ
 );
 
-CREATE INDEX ASYNC cash_transactions_account_idx ON cash_transactions(account_id, created_at);
-CREATE INDEX ASYNC cash_transactions_status_idx ON cash_transactions(status);
+CREATE INDEX ASYNC IF NOT EXISTS cash_transactions_account_idx ON cash_transactions(account_id, created_at);
+CREATE INDEX ASYNC IF NOT EXISTS cash_transactions_status_idx ON cash_transactions(status);
 
 
 -- =========================================================
@@ -255,7 +255,7 @@ CREATE INDEX ASYNC cash_transactions_status_idx ON cash_transactions(status);
 -- Append-only accounting truth
 -- =========================================================
 
-CREATE TABLE ledger_entries (
+CREATE TABLE IF NOT EXISTS ledger_entries (
     entry_id UUID PRIMARY KEY,
 
     account_id UUID NOT NULL,
@@ -290,11 +290,11 @@ CREATE TABLE ledger_entries (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX ASYNC ledger_entries_account_idx ON ledger_entries(account_id, created_at);
-CREATE INDEX ASYNC ledger_entries_market_idx ON ledger_entries(market_id, created_at);
-CREATE INDEX ASYNC ledger_entries_trade_idx ON ledger_entries(trade_id);
-CREATE INDEX ASYNC ledger_entries_order_idx ON ledger_entries(order_id);
-CREATE INDEX ASYNC ledger_entries_cash_txn_idx ON ledger_entries(cash_txn_id);
+CREATE INDEX ASYNC IF NOT EXISTS ledger_entries_account_idx ON ledger_entries(account_id, created_at);
+CREATE INDEX ASYNC IF NOT EXISTS ledger_entries_market_idx ON ledger_entries(market_id, created_at);
+CREATE INDEX ASYNC IF NOT EXISTS ledger_entries_trade_idx ON ledger_entries(trade_id);
+CREATE INDEX ASYNC IF NOT EXISTS ledger_entries_order_idx ON ledger_entries(order_id);
+CREATE INDEX ASYNC IF NOT EXISTS ledger_entries_cash_txn_idx ON ledger_entries(cash_txn_id);
 
 
 -- =========================================================
@@ -302,7 +302,7 @@ CREATE INDEX ASYNC ledger_entries_cash_txn_idx ON ledger_entries(cash_txn_id);
 -- Per-account settlement result after market resolution
 -- =========================================================
 
-CREATE TABLE market_settlements (
+CREATE TABLE IF NOT EXISTS market_settlements (
     settlement_id UUID PRIMARY KEY,
 
     market_id UUID NOT NULL,
@@ -319,7 +319,23 @@ CREATE TABLE market_settlements (
     UNIQUE (market_id, account_id)
 );
 
-CREATE INDEX ASYNC market_settlements_account_idx ON market_settlements(account_id);
+CREATE INDEX ASYNC IF NOT EXISTS market_settlements_account_idx ON market_settlements(account_id);
+
+
+-- =========================================================
+-- 12. Matchmaker leases
+-- Lightweight ownership to avoid duplicate matching work
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS matchmaker_market_leases (
+    market_id UUID PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ASYNC IF NOT EXISTS matchmaker_market_leases_exp_idx
+    ON matchmaker_market_leases(lease_expires_at);
 
 
 -- =========================================================

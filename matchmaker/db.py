@@ -1,6 +1,7 @@
 import asyncio
 import random
 import uuid
+from datetime import datetime, timezone
 
 import asyncpg
 
@@ -59,12 +60,15 @@ class MatchRepository:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT market_id
-                FROM orders
-                WHERE status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
-                  AND remaining_qty > 0
-                GROUP BY market_id
-                ORDER BY min(global_seq)
+                SELECT o.market_id
+                FROM orders o
+                JOIN markets m ON m.market_id = o.market_id
+                WHERE o.status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
+                  AND o.remaining_qty > 0
+                  AND m.status = 'ACTIVE'
+                  AND (m.close_time IS NULL OR m.close_time > now())
+                GROUP BY o.market_id
+                ORDER BY min(o.global_seq)
                 LIMIT $1
                 """,
                 limit,
@@ -112,7 +116,7 @@ class MatchRepository:
                 WHERE market_id = $1
                   AND status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
                   AND remaining_qty > 0
-                ORDER BY global_seq
+                ORDER BY side, price_cents DESC, global_seq
                 LIMIT $2
                 """,
                 market_id,
@@ -162,6 +166,21 @@ class MatchRepository:
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
+                    market = await conn.fetchrow(
+                        """
+                        SELECT market_id, status, close_time
+                        FROM markets
+                        WHERE market_id = $1
+                        """,
+                        market_id,
+                    )
+                    if not market:
+                        return False
+                    if market["status"] != "ACTIVE":
+                        return False
+                    if market["close_time"] is not None and market["close_time"] <= datetime.now(timezone.utc):
+                        return False
+
                     yes_row = await conn.fetchrow(
                         """
                         SELECT request_id, account_id, market_id, side, remaining_qty,
@@ -195,6 +214,9 @@ class MatchRepository:
                         return False
                     if yes_row["price_cents"] + no_row["price_cents"] < 100:
                         return False
+                    if yes_row["account_id"] == no_row["account_id"]:
+                        # Prevent self-trading and avoid duplicate trade_parties keys.
+                        return False
 
                     yes_fill_cost = qty * yes_row["price_cents"]
                     no_fill_cost = qty * no_row["price_cents"]
@@ -205,6 +227,7 @@ class MatchRepository:
                         SET locked_cash_cents = locked_cash_cents - $2,
                             updated_at = now()
                         WHERE account_id = $1
+                          AND status = 'ACTIVE'
                           AND locked_cash_cents >= $2
                         """,
                         yes_row["account_id"],
@@ -216,6 +239,7 @@ class MatchRepository:
                         SET locked_cash_cents = locked_cash_cents - $2,
                             updated_at = now()
                         WHERE account_id = $1
+                          AND status = 'ACTIVE'
                           AND locked_cash_cents >= $2
                         """,
                         no_row["account_id"],
@@ -309,27 +333,45 @@ class MatchRepository:
 
                     await conn.execute(
                         """
+                        INSERT INTO trade_parties (
+                            trade_id, account_id, role, side_acquired, qty, cash_delta_cents
+                        )
+                        VALUES
+                        ($1, $2, 'BUYER', 'YES', $3, $4),
+                        ($1, $5, 'BUYER', 'NO',  $3, $6)
+                        """,
+                        trade_id,
+                        yes_row["account_id"],
+                        qty,
+                        -yes_fill_cost,
+                        no_row["account_id"],
+                        -no_fill_cost,
+                    )
+
+                    await conn.execute(
+                        """
                         INSERT INTO ledger_entries (
-                            entry_id, account_id, market_id, order_id,
+                            entry_id, account_id, market_id, order_id, trade_id,
                             cash_delta_cents, locked_cash_delta_cents,
                             yes_share_delta, no_share_delta,
                             locked_yes_delta, locked_no_delta,
                             reason, notes
                         )
                         VALUES
-                        ($1, $2, $3, $4, 0, $5, $6, 0, 0, 0, 'TRADE_EXECUTION', $7),
-                        ($8, $9, $3, $10, 0, $11, 0, $12, 0, 0, 'TRADE_EXECUTION', $13)
+                        ($1, $2, $3, $4, $5, 0, $6, $7, 0, 0, 0, 'TRADE_EXECUTION', $8),
+                        ($9, $10, $3, $11, $5, 0, $12, 0, $13, 0, 0, 'TRADE_EXECUTION', $14)
                         """,
                         str(uuid.uuid4()),
                         yes_row["account_id"],
                         market_id,
                         yes_order_id,
+                        trade_id,
                         -yes_fill_cost,
                         qty,
                         f"Match execution for YES order {yes_order_id}",
                         str(uuid.uuid4()),
-                        no_row["account_id"],                        
-                        no_order_id,                      
+                        no_row["account_id"],
+                        no_order_id,
                         -no_fill_cost,
                         qty,
                         f"Match execution for NO order {no_order_id}",

@@ -9,6 +9,8 @@
 ## Schema notes
  - `tables-create.sql` is the Postgres-oriented schema with foreign keys.
  - `tables-create-dsql.sql` is the Aurora DSQL-compatible schema (no foreign keys, `CREATE INDEX ASYNC`).
+ - `tables-create-dsql.sql` is idempotent (`IF NOT EXISTS`) and includes all core tables used by listener + matchmaker, including `matchmaker_market_leases`.
+ - `tables-upgrade-from-minimal-dsql.sql` upgrades older/minimal project DBs to match the current service expectations.
 
 ## Services
  - `client/order_client.py`: simple order submitter client.

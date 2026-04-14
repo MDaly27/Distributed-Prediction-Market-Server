@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 
 class ValidationError(Exception):
@@ -37,6 +38,12 @@ class SubmitOrderRequest:
 
         if model.side not in {"YES", "NO"}:
             raise ValidationError("side must be YES or NO")
+        try:
+            UUID(model.request_id)
+            UUID(model.account_id)
+            UUID(model.market_id)
+        except ValueError as exc:
+            raise ValidationError(f"invalid UUID field: {exc}") from exc
         if model.qty <= 0:
             raise ValidationError("qty must be > 0")
         if not 0 <= model.price_cents <= 100:

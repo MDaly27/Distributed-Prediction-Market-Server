@@ -37,6 +37,14 @@ async def match_market(repo: MatchRepository, market_id: str, order_scan_limit: 
             j += 1
             continue
 
+        # Skip self-cross candidates; keep scanning for valid counterparties.
+        if yes_order.account_id == no_order.account_id:
+            if yes_order.global_seq <= no_order.global_seq:
+                i += 1
+            else:
+                j += 1
+            continue
+
         # Binary market crossing condition.
         if yes_order.price_cents + no_order.price_cents < 100:
             break
