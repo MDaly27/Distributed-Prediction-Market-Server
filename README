@@ -16,3 +16,11 @@
  - `client/client-listener`: TCP order-ingest listener and test client.
  - `matchmaker`: order matching worker process designed to run one or many instances.
  - `executor`: settlement worker process designed to run one or many instances.
+
+## Test
+ - `test/system_test.py` runs an end-to-end concurrency test:
+   - starts multiple listeners, matchmakers, and executors simultaneously
+   - creates markets/accounts, submits mixed crossing/non-crossing orders
+   - verifies expected matching + settlement outcomes
+   - verifies open unmatched orders remain open
+   - cleans up all test-created data at the end
