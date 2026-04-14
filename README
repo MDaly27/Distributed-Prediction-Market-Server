@@ -6,3 +6,6 @@
  - Aurora is single writer, with read duplicates, so it will handle the atomicity of the orders and matches. 
     - we must construct transactions that require balance be above the price of the order, among other things.
 
+## Schema notes
+ - `tables-create.sql` is the Postgres-oriented schema with foreign keys.
+ - `tables-create-dsql.sql` is the Aurora DSQL-compatible schema (no foreign keys, `CREATE INDEX ASYNC`).
