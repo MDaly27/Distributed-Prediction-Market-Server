@@ -1,3 +1,4 @@
 # Client Services
 
-- `listener/`: accepts client TCP order submissions and writes them to DSQL.
+- `order_client.py`: lightweight client that submits orders to the listener.
+- `client-listener/`: TCP listener that accepts client orders and writes to DSQL.

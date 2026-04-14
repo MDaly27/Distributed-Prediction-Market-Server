@@ -11,5 +11,6 @@
  - `tables-create-dsql.sql` is the Aurora DSQL-compatible schema (no foreign keys, `CREATE INDEX ASYNC`).
 
 ## Services
- - `client/listener`: TCP order-ingest listener and test client.
+ - `client/order_client.py`: simple order submitter client.
+ - `client/client-listener`: TCP order-ingest listener and test client.
  - `matchmaker`: order matching worker process designed to run one or many instances.
