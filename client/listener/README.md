@@ -51,7 +51,7 @@ Secret value can be raw token text or JSON with `token` or `auth_token`.
 ## Run
 
 ```bash
-cd client-listener
+cd client/listener
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
