@@ -1,0 +1,506 @@
+Thought
+Thought for 18s
+
+Yes. Here is a concrete implementation guide for Codex for a prediction market built on your DSQL schema. The schema already gives the right persistence layers: accounts, markets, positions, orders, trades, cash_transactions, ledger_entries, market_resolutions, and supporting tables like order_cancels and trade_parties. accounts and positions are snapshot state, while ledger_entries is the append-only accounting trail.
+
+The important DSQL constraints to design around are:
+
+Aurora DSQL is PostgreSQL-compatible and uses the PostgreSQL wire protocol, so normal PostgreSQL clients and transaction patterns are the baseline.
+Aurora DSQL uses optimistic concurrency control with snapshot isolation. Conflicts are detected at commit time, so transactional writes must be written to tolerate retries. AWS explicitly says the first conflicting transaction to commit wins and the other receives an OCC error.
+Transactions should be kept small, because larger write sets are more likely to conflict under OCC.
+1. System roles
+
+Build the system with three process types.
+
+A. Client listener / order-entry service
+
+This is the RPC-facing service. It accepts requests from clients and performs:
+
+account lookup
+market lookup
+balance / position checks
+asset locking
+order insertion
+order cancel submission
+market data queries
+deposit / withdrawal requests
+
+This service should not do actual book matching.
+
+B. Matchmaker node
+
+This is an async worker. It owns one or more markets and does:
+
+read newly accepted/open orders in sequence
+keep an in-memory order book per owned market
+decide whether a new order crosses resting liquidity
+write trades, update orders, update positions, update accounts, and append ledger_entries in one transaction
+
+For simplicity, assign one matcher owner per market. Do not have multiple matchers racing on the same market book unless you later add explicit sharding or leases.
+
+C. Settlement / admin worker
+
+This handles:
+
+deposits becoming completed
+withdrawals becoming completed
+market resolution
+settlement payouts
+reconciliation / repair tasks
+2. RPC surface
+
+Implement these RPCs first.
+
+Account / wallet RPCs
+CreateAccount
+GetAccount
+RequestDeposit
+CompleteDeposit
+RequestWithdrawal
+CompleteWithdrawal
+GetPositions
+GetLedger
+Market RPCs
+CreateMarket
+GetMarket
+ListMarkets
+ResolveMarket
+GetOrderBook
+GetTrades
+Order-entry RPCs
+SubmitOrder
+CancelOrder
+GetOrder
+ListOpenOrders
+Matcher / internal RPCs
+
+These can be internal methods rather than exposed RPCs:
+
+LoadMarketState
+PollNewOrders
+ApplyAcceptedOrderToBook
+TryMatch
+CommitMatch
+RebuildBookFromDB
+3. Required request models
+SubmitOrder request
+
+Use a client-generated idempotency key.
+
+SubmitOrderRequest {
+  request_id: UUID
+  account_id: UUID
+  market_id: UUID
+  side: "YES" | "NO"
+  qty: int64
+  price_cents: int64
+  time_in_force: "GTC" | "IOC" | "FOK"
+  ingress_ts_ns: int64
+}
+CancelOrder request
+CancelOrderRequest {
+  cancel_id: UUID
+  account_id: UUID
+  order_id: UUID
+  reason: string
+}
+CreateMarket request
+CreateMarketRequest {
+  market_id: UUID
+  slug: string
+  title: string
+  description: string
+  tick_size_cents: int64
+  min_price_cents: int64
+  max_price_cents: int64
+  close_time: timestamp
+  created_by: UUID
+}
+4. Core rule: what must be synchronous vs asynchronous
+Synchronous on order submission
+
+Before an order is admitted, the order-entry service must verify:
+
+account exists and is ACTIVE
+market exists and is ACTIVE
+order price is within the market’s min/max range
+qty > 0
+the account has enough available cash or enough available shares, depending on order semantics
+funds or shares can be locked
+
+Then it must atomically:
+
+decrement available asset
+increment locked asset
+insert into orders
+insert ledger_entries row with ORDER_LOCK
+Asynchronous on matching
+
+The matcher later:
+
+reads admitted orders
+tries to match them
+atomically commits trades and balance/position updates
+
+That split is important. Order validity is checked at entry time, not by constantly rescanning the database.
+
+5. Exact order-entry behavior
+
+For v1, keep it simple:
+
+only LIMIT orders
+only binary markets
+price quoted in YES cents
+use one market owner matcher
+YES buy
+
+Needed cash is:
+qty * price_cents
+
+The entry service should try an atomic conditional update like:
+
+UPDATE accounts
+SET
+  available_cash_cents = available_cash_cents - $needed,
+  locked_cash_cents = locked_cash_cents + $needed,
+  updated_at = now()
+WHERE account_id = $account_id
+  AND status = 'ACTIVE'
+  AND available_cash_cents >= $needed
+RETURNING account_id;
+
+If zero rows are returned:
+
+reject with insufficient funds or invalid account
+
+If one row is returned:
+
+insert into orders
+insert into ledger_entries with locked_cash_delta_cents = +needed, reason='ORDER_LOCK'
+
+This pattern is safe because the check and decrement happen in one statement, and under DSQL conflicts are handled at commit time with OCC retry.
+
+YES sell
+
+For your current schema, selling is share-based. The service should move shares from available to locked in positions:
+
+UPDATE positions
+SET
+  yes_shares = yes_shares - $qty,
+  locked_yes_shares = locked_yes_shares + $qty,
+  updated_at = now()
+WHERE account_id = $account_id
+  AND market_id = $market_id
+  AND yes_shares >= $qty
+RETURNING account_id, market_id;
+
+If zero rows:
+
+reject with insufficient shares
+
+If success:
+
+insert order
+insert ledger row with locked_yes_delta = +qty, reason='ORDER_LOCK'
+NO sell
+
+Same pattern using no_shares and locked_no_shares.
+
+6. SubmitOrder transaction
+
+Codex should implement SubmitOrder as:
+
+start transaction
+read markets row for market_id
+verify market status and price bounds
+conditionally lock funds or shares
+insert into orders with:
+status='ACCEPTED'
+remaining_qty=qty
+insert one ledger_entries row with reason='ORDER_LOCK'
+commit
+on OCC/serialization conflict, retry with backoff
+
+Pseudocode:
+
+SubmitOrder(req):
+  retry txn:
+    market = SELECT ... FROM markets WHERE market_id = req.market_id
+    validate market
+
+    if req.side is buy-like:
+      conditional UPDATE accounts ... available >= needed
+    else:
+      conditional UPDATE positions ... shares >= qty
+
+    INSERT INTO orders(...)
+    INSERT INTO ledger_entries(... reason='ORDER_LOCK' ...)
+  return accepted(order_id, global_seq)
+
+Use request_id for idempotency. If the same request is retried after a network error, first check whether an order row already exists for that request_id.
+
+7. CancelOrder transaction
+
+CancelOrder should not directly delete an order. Your schema already has order_cancels, which should be used as the event log.
+
+Flow:
+
+start transaction
+read orders by order_id
+verify:
+same account
+status is OPEN, ACCEPTED, or PARTIALLY_FILLED
+remaining_qty > 0
+insert into order_cancels
+update orders.status='CANCELLED'
+unlock any remaining cash or shares
+append ledger_entries row with reason='ORDER_UNLOCK'
+commit
+
+The unlock amount depends on remaining quantity:
+
+buy order: unlock remaining_qty * price_cents
+sell order: unlock remaining shares
+8. What the matchmaker node does
+
+The matcher should not scan entire tables. It should keep per-market state:
+
+MarketWorkerState {
+  market_id
+  last_seen_global_seq
+  in_memory_yes_book
+  in_memory_no_book
+}
+On startup
+
+For each owned market:
+
+load market row
+load all open/accepted/partially-filled orders for that market
+rebuild in-memory book
+set last_seen_global_seq = max(global_seq) seen
+In steady state
+
+Poll only new rows:
+
+SELECT *
+FROM orders
+WHERE market_id = $market_id
+  AND global_seq > $last_seen
+  AND status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
+ORDER BY global_seq
+LIMIT 100;
+
+Then, for each order in order:
+
+check if it crosses current opposite book
+if no, insert into in-memory book and mark it OPEN if still ACCEPTED
+if yes, execute one or more match transactions
+9. Match execution rules
+
+For v1, let the matcher treat global_seq order as authoritative intake order. The matcher should only match against orders that are still open in the database.
+
+Each individual match should be one small transaction:
+
+re-read aggressing order and resting order
+verify both are still open and have remaining quantity
+compute fill_qty
+insert into trades
+insert into trade_parties
+update both orders’ remaining_qty and status
+move locked assets / settled assets in accounts and positions
+append ledger_entries for both accounts
+commit
+on OCC conflict, retry or reload book
+
+This re-read is important. The in-memory book is just a candidate set. The DB transaction is the final guard that ensures the original orders are still open.
+
+10. Match transaction invariants
+
+Codex should enforce these inside the transaction.
+
+Required preconditions
+
+Aggressing order:
+
+status IN ('ACCEPTED','OPEN','PARTIALLY_FILLED')
+remaining_qty > 0
+
+Resting order:
+
+same allowed statuses
+remaining_qty > 0
+Fill amount
+fill_qty = min(aggressing.remaining_qty, resting.remaining_qty)
+Trade price
+
+Use the resting order price unless you intentionally choose another rule.
+
+Order updates
+
+If remaining_qty - fill_qty == 0, status becomes FILLED.
+Else status becomes PARTIALLY_FILLED.
+
+Buyer / seller accounting
+
+For a YES-side trade:
+
+buyer gets yes_share_delta = +fill_qty
+seller gets yes_share_delta = -fill_qty
+seller gets positive cash
+buyer consumes locked cash or pays cash
+
+Your schema already supports these adjustments through accounts, positions, and ledger_entries.
+
+11. How to ensure original orders are still open
+
+This must be enforced in the transaction that inserts the trade.
+
+Pattern:
+
+SELECT ... FROM orders WHERE request_id = ...
+confirm valid status and remaining_qty > 0
+UPDATE orders SET remaining_qty = remaining_qty - fill_qty ... WHERE request_id = ... AND remaining_qty >= fill_qty AND status IN (...)
+check row count
+
+If the guarded update affects zero rows, the order is no longer usable. Abort and rebuild local book state.
+
+Example guarded update:
+
+UPDATE orders
+SET
+  remaining_qty = remaining_qty - $fill_qty,
+  status = CASE
+    WHEN remaining_qty - $fill_qty = 0 THEN 'FILLED'
+    ELSE 'PARTIALLY_FILLED'
+  END,
+  updated_at = now()
+WHERE request_id = $order_id
+  AND status IN ('ACCEPTED','OPEN','PARTIALLY_FILLED')
+  AND remaining_qty >= $fill_qty
+RETURNING request_id, remaining_qty, status;
+
+This makes the DB the final arbiter even if the in-memory matcher had stale information.
+
+12. How to know whether an order can be submitted
+
+Do not “constantly check validity.” Check it when the request arrives.
+
+For SubmitOrder, the entry service must synchronously read:
+
+accounts
+markets
+positions if share-backed sell
+
+And synchronously write:
+
+accounts or positions lock move
+orders
+ledger_entries
+
+That is enough. Once the assets are locked, the system does not need to repeatedly re-prove solvency for that order.
+
+13. Recommended process ownership
+
+Keep ownership simple.
+
+Order-entry service owns:
+request validation
+locks
+inserts into orders
+inserts into order_cancels
+deposit / withdrawal initiation
+Matchmaker owns:
+deciding matches
+inserting into trades
+updating orders
+updating positions
+updating accounts
+appending trade-related ledger_entries
+Settlement worker owns:
+market_resolutions
+market_settlements
+payout ledger entries
+final share unwind
+14. Minimal code structure for Codex
+
+Suggested packages:
+
+cmd/
+  order_listener/
+  matcher/
+  settlement_worker/
+
+internal/
+  db/
+    tx.go
+    retry.go
+    queries.go
+  models/
+  rpc/
+  orderentry/
+    submit_order.go
+    cancel_order.go
+  matcher/
+    market_worker.go
+    book.go
+    match.go
+    rebuild.go
+  accounting/
+    ledger.go
+    balances.go
+  settlement/
+    resolve_market.go
+15. Functions Codex should implement first
+DB helpers
+WithRetryingTx(ctx, fn)
+GetAccountForUpdate(...)
+GetMarket(...)
+TryLockCash(...)
+TryLockYesShares(...)
+TryLockNoShares(...)
+InsertOrder(...)
+InsertLedgerEntry(...)
+InsertTrade(...)
+UpdateOrderFill(...)
+UnlockOrderRemainder(...)
+Order-entry functions
+SubmitOrder(ctx, req)
+CancelOrder(ctx, req)
+RequestDeposit(ctx, req)
+CompleteDeposit(ctx, req)
+Matcher functions
+LoadOpenOrdersForMarket(ctx, marketID)
+PollAcceptedOrders(ctx, marketID, afterSeq, limit)
+ApplyOrder(ctx, order)
+TryCross(order, book) -> []MatchCandidate
+CommitMatch(ctx, candidate)
+RebuildBook(ctx, marketID)
+16. Retry and error policy
+
+Because DSQL uses OCC, Codex must implement retry wrappers for transactional writes. AWS recommends retrying transient OCC conflicts and keeping transactions small.
+
+Rules:
+
+retry on OCC / serialization conflict
+do not retry validation failures
+use exponential backoff with jitter
+keep transactions narrow and deterministic
+17. First milestone
+
+Tell Codex to build this in order:
+
+schema migration runner against DSQL
+CreateAccount
+CreateMarket
+SubmitOrder for simple YES buy and YES sell
+CancelOrder
+single-market matcher loop
+trade commit transaction
+deposit completion
+market resolution and settlement
+18. One-paragraph implementation summary for Codex
+
+Build a DSQL-backed prediction market with an RPC order-entry service and async per-market matchmaker workers. The order-entry service must synchronously validate accounts and markets, atomically lock cash or shares using conditional UPDATE ... WHERE balance >= needed RETURNING ..., insert the order row, and append a ledger entry in one transaction. Matchmaker workers poll new admitted orders by global_seq, maintain an in-memory per-market book, and when they find a crossing, they must run a small transaction that revalidates both orders are still open, inserts a trade, updates remaining quantities and statuses, updates balances and positions, appends ledger entries, and commits with OCC-aware retry. Use the DB as the final source of truth, use in-memory books only as acceleration, and keep one matcher owner per market.
+
+If you want, I can turn this into a Codex-ready engineering spec file or a set of Go/Python interface definitions next.
