@@ -31,6 +31,13 @@ def _uuid_csv(values: list[str]) -> str:
     return ", ".join(f"'{v}'::uuid" for v in values)
 
 
+def _is_retryable_occ(exc: Exception) -> bool:
+    if isinstance(exc, asyncpg.PostgresError):
+        if exc.sqlstate in {"40001", "40P01"}:
+            return True
+    return "OC000" in str(exc)
+
+
 def _build_submit_message(
     auth_token: str,
     request_id: str,
@@ -205,6 +212,20 @@ async def _cleanup(conn: asyncpg.Connection, market_ids: list[str], account_ids:
     await conn.execute(f"DELETE FROM matchmaker_market_leases WHERE market_id IN ({m_ids})")
     await conn.execute(f"DELETE FROM markets WHERE market_id IN ({m_ids})")
     await conn.execute(f"DELETE FROM accounts WHERE account_id IN ({a_ids})")
+
+
+async def _cleanup_with_retries(
+    conn: asyncpg.Connection, market_ids: list[str], account_ids: list[str]
+) -> None:
+    attempts = 6
+    for i in range(attempts):
+        try:
+            await _cleanup(conn, market_ids, account_ids)
+            return
+        except Exception as exc:
+            if not _is_retryable_occ(exc) or i == attempts - 1:
+                raise
+            await asyncio.sleep(0.15 * (i + 1))
 
 
 async def _run_test(args: argparse.Namespace) -> None:
@@ -413,7 +434,11 @@ async def _run_test(args: argparse.Namespace) -> None:
         try:
             if test_data is not None:
                 async with pool.acquire() as conn:
-                    await _cleanup(conn, list(test_data["markets"].values()), list(test_data["accounts"].values()))
+                    await _cleanup_with_retries(
+                        conn,
+                        list(test_data["markets"].values()),
+                        list(test_data["accounts"].values()),
+                    )
         finally:
             await pool.close()
             _stop_procs(procs)
