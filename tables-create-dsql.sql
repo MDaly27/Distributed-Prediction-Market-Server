@@ -1,5 +1,5 @@
-# Aurora DSQL does not support foreign keys; relationships are enforced in app logic.
-# Aurora DSQL requires CREATE INDEX ASYNC; all indexes here use ASYNC.
+-- Aurora DSQL does not support foreign keys; relationships are enforced in app logic.
+-- Aurora DSQL requires CREATE INDEX ASYNC; all indexes here use ASYNC.
 -- =========================================================
 -- Prediction Market Exchange Schema
 -- v1 starter schema
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS markets (
 
 CREATE INDEX ASYNC IF NOT EXISTS markets_status_idx ON markets(status);
 CREATE INDEX ASYNC IF NOT EXISTS markets_close_time_idx ON markets(close_time);
+CREATE INDEX ASYNC IF NOT EXISTS markets_resolve_time_idx ON markets(resolve_time);
 
 
 -- =========================================================
@@ -336,6 +337,40 @@ CREATE TABLE IF NOT EXISTS matchmaker_market_leases (
 
 CREATE INDEX ASYNC IF NOT EXISTS matchmaker_market_leases_exp_idx
     ON matchmaker_market_leases(lease_expires_at);
+
+-- =========================================================
+-- 13. Settlement runs
+-- Global settlement state by market for executor nodes
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS market_settlement_runs (
+    market_id UUID PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
+    owner_id TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    settled_accounts BIGINT NOT NULL DEFAULT 0,
+    error_text TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ASYNC IF NOT EXISTS market_settlement_runs_status_idx
+    ON market_settlement_runs(status, updated_at);
+
+-- =========================================================
+-- 14. Executor leases
+-- Lightweight ownership to avoid duplicate settlement work
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS execution_market_leases (
+    market_id UUID PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ASYNC IF NOT EXISTS execution_market_leases_exp_idx
+    ON execution_market_leases(lease_expires_at);
 
 
 -- =========================================================

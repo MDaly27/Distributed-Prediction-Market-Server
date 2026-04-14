@@ -6,13 +6,13 @@
  - Aurora is single writer, with read duplicates, so it will handle the atomicity of the orders and matches. 
     - we must construct transactions that require balance be above the price of the order, among other things.
 
-## Schema notes
- - `tables-create.sql` is the Postgres-oriented schema with foreign keys.
- - `tables-create-dsql.sql` is the Aurora DSQL-compatible schema (no foreign keys, `CREATE INDEX ASYNC`).
- - `tables-create-dsql.sql` is idempotent (`IF NOT EXISTS`) and includes all core tables used by listener + matchmaker, including `matchmaker_market_leases`.
- - `tables-upgrade-from-minimal-dsql.sql` upgrades older/minimal project DBs to match the current service expectations.
+## Schema
+ - Use `tables-create-dsql.sql` as the single authoritative schema for this project.
+ - It is Aurora DSQL-compatible (no foreign keys, `CREATE INDEX ASYNC`) and idempotent (`IF NOT EXISTS`).
+ - It includes listener, matchmaker, and executor tables.
 
 ## Services
  - `client/order_client.py`: simple order submitter client.
  - `client/client-listener`: TCP order-ingest listener and test client.
  - `matchmaker`: order matching worker process designed to run one or many instances.
+ - `executor`: settlement worker process designed to run one or many instances.
