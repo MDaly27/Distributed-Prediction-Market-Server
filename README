@@ -24,3 +24,8 @@
    - verifies expected matching + settlement outcomes
    - verifies open unmatched orders remain open
    - cleans up all test-created data at the end
+
+### Re-running the system test on EC2
+ - Install test dependency: `python3 -m venv .venv-test && . .venv-test/bin/activate && pip install -r test/requirements.txt`
+ - Run helper script: `bash test/run_system_test_ec2.sh`
+ - The helper script generates a fresh Aurora DSQL IAM auth token with the AWS CLI and then runs `test/system_test.py`.
