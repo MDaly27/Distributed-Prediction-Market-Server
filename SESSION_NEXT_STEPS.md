@@ -1,110 +1,87 @@
 # Future Session Handoff
 
-## Current state (as of this handoff)
+## Current State (as of this handoff)
+- Authoritative schema: `tables-create-dsql.sql`.
+- Core distributed services are active: listener, matchmaker, executor.
+- Listener now supports full RPC surface for order lifecycle, balances, markets, and reads.
+- End-to-end test scripts are in place and pass via:
+  - `test/system_test.py`
+  - `test/rpc_features_test.py`
+  - `test/run_system_test_ec2.sh`
 
-- Authoritative schema: `tables-create-dsql.sql` (single source of truth).
-- Services:
-  - `client/client-listener` (order ingest)
-  - `matchmaker` (distributed matching)
-  - `executor` (distributed settlement)
-- End-to-end concurrent test exists: `test/system_test.py`.
-- Last known result on EC2: `SYSTEM TEST PASSED`.
+## Primary Next Goal: Advanced Client
+Build a significantly more capable client layer on top of current RPCs.
 
-## What the current test validates
+### 1. Client SDK + typed models (highest priority)
+Create a reusable client package (`client/sdk`) with:
+- typed request/response models,
+- retries/backoff for transient failures,
+- idempotency helper utilities,
+- pagination helpers for list endpoints,
+- shared auth/session configuration.
 
-`test/system_test.py` starts multiple instances of each process simultaneously:
+### 2. Interactive trading CLI
+Add a real operator CLI (`client/cli.py`) with commands for:
+- market discovery, order book view, open orders view,
+- submit/cancel/replace/cancel-all,
+- balances/positions/trades,
+- deposit/withdraw,
+- market admin actions (for privileged roles).
 
-- 2 listener nodes
-- 2 matchmaker nodes
-- 2 executor nodes
+### 3. Streaming client view
+Add near-real-time polling/stream mode in client:
+- watch order status transitions,
+- watch top-of-book changes,
+- watch fills and position changes.
 
-Then it validates:
+### 4. Client-side safety rails
+Implement preflight checks before submit/replace:
+- price/tick-size validation,
+- market status validation cache,
+- balance sufficiency hints,
+- clear error mapping to actionable messages.
 
-1. Order ingress across multiple markets.
-2. Matching behavior with crossing and non-crossing orders.
-3. Partial fill behavior.
-4. Open unmatched orders persist (are not lost or force-closed).
-5. Resolved markets settle with expected payouts.
-6. Settlement run status completes (`market_settlement_runs`).
-7. Cleanup of test-created rows.
+## Additional Required Features (System)
 
-## What is still missing / not fully covered
+### 1. IOC/FOK enforcement (matching semantics)
+- Implement actual IOC/FOK behavior in order lifecycle.
+- Extend tests with explicit IOC/FOK correctness cases.
 
-### Product behavior gaps
+### 2. Invariants checker
+Add `test/invariants_check.py` and run after suites:
+- non-negative account/position invariants,
+- order-state consistency,
+- ledger consistency checks,
+- settlement uniqueness and conservation checks.
 
-1. No explicit cancel-order API and cancel processing path.
-2. No IOC/FOK behavior tests (listener accepts these values, but no dedicated execution logic/tests for rejection/expiry semantics).
-3. No full cash lifecycle (deposit/withdrawal flow and reconciliation around `cash_transactions`).
-4. No market lifecycle admin flows (DRAFT->ACTIVE->HALTED->CLOSED->RESOLVED with authorization/rules).
-5. No fee model and fee ledgering.
+### 3. Observability baseline
+- structured JSON logs for each service,
+- counters/timers for ingest/match/settle throughput,
+- error rate and OCC retry metrics.
 
-### Matching/settlement correctness gaps
+### 4. Deployment hardening
+- systemd units per service,
+- restart policy and environment templates,
+- health/readiness probes and startup ordering.
 
-1. Matching price policy is basic for binary crossing (no advanced tie-breaking policy documented beyond current implementation).
-2. No strict invariants checker after each run (e.g., aggregate conservation checks for cash/shares/locks across all tables).
-3. Settlement uses project-level simplified payout semantics for `CANCELLED` markets; needs explicit policy definition.
+### 5. Security hardening
+- default deployed auth mode to Secrets Manager,
+- least-privilege IAM policies by service role,
+- auth token rotation and operational runbook.
 
-### Distributed/system gaps
+### 6. Performance testing
+- stress/soak test suite with higher concurrency,
+- benchmark report for throughput, p95/p99 latency, retry rates.
 
-1. No durable supervisor/daemon strategy (systemd units, restart policy, health checks).
-2. No central metrics/alerts/log aggregation.
-3. No load/stress test for high throughput and long-running contention.
-4. No chaos/recovery tests (instance kill mid-transaction, network partitions).
+## Suggested Execution Order
+1. Client SDK + CLI
+2. IOC/FOK + invariants checker
+3. Observability and deployment hardening
+4. Security hardening
+5. Stress/soak performance validation
 
-### Security/ops gaps
-
-1. Static token auth still used for client listener test path; move to Secrets Manager mode by default in deployed envs.
-2. No least-privilege IAM policy doc for listener/matchmaker/executor roles.
-3. No runbooks for operational incidents.
-
-## Recommended next tasks (in order)
-
-1. Add a DB invariants checker script.
-   - New file: `test/invariants_check.py`
-   - Must verify after test runs:
-     - `accounts.available_cash_cents >= 0`, `locked_cash_cents >= 0`
-     - `orders.remaining_qty` in range and status consistency
-     - `positions` non-negative values
-     - no duplicate settlement rows per `(market_id, account_id)`
-
-2. Implement order cancel endpoint + logic.
-   - Listener action: `cancel_order`
-   - Write to `order_cancels`, update `orders.status`, unlock reserved funds/shares, append `ledger_entries` (`ORDER_UNLOCK`).
-
-3. Add IOC/FOK enforcement in matchmaker path with tests.
-   - IOC: fill available now; cancel remainder.
-   - FOK: fill all immediately or cancel fully.
-
-4. Add a stress test runner.
-   - New file: `test/stress_test.py`
-   - Run multiple listeners + matchmakers + executors with larger order volumes and random distributions.
-
-5. Add deployment scripts.
-   - `deploy/systemd/*.service` files for each node type.
-   - Include environment file templates and restart policy.
-
-6. Add observability basics.
-   - Structured JSON logging for each service.
-   - Counters/timers (ingest rate, match rate, settlement rate, OCC retries, failures).
-
-## How to run the current system test
-
-From EC2 (or any host with network access and Python env):
-
-1. Generate IAM auth token and DSN.
-2. Run:
-
-```bash
-python3 test/system_test.py --db-dsn '<dsn>' --auth-token dev-shared-token
-```
-
-Expected success output:
-
-- `SYSTEM TEST PASSED`
-
-## Important note for future sessions
-
-Do not reintroduce multiple schema sources of truth.
-
-- Keep all schema evolution in `tables-create-dsql.sql`.
-- If a migration is needed, add a proper migration mechanism, but keep one authoritative target schema definition.
+## Success Criteria for Next Session
+- Advanced client can execute full lifecycle (submit/cancel/replace/portfolio views) cleanly.
+- IOC/FOK tests pass.
+- Invariants checker passes after both existing test suites.
+- Basic metrics/logging and deployment units are checked in.
