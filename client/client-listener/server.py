@@ -14,40 +14,47 @@ def _json_response(payload: dict[str, Any]) -> bytes:
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-async def _handle_submit_order(
-    message: dict[str, Any],
-    auth_token: str,
-    auth,
-    repo: OrderRepository,
-) -> dict[str, Any]:
+async def _ensure_auth(auth, auth_token: str) -> None:
     if not await auth.validate(auth_token):
-        return {"ok": False, "error": "unauthorized"}
+        raise SubmissionError("unauthorized")
 
+
+async def _handle_submit_order(message: dict[str, Any], auth_token: str, auth, repo: OrderRepository) -> dict[str, Any]:
+    await _ensure_auth(auth, auth_token)
     request_payload = message.get("request")
     if not isinstance(request_payload, dict):
-        return {"ok": False, "error": "request payload must be an object"}
-
+        raise SubmissionError("request payload must be an object")
     req = SubmitOrderRequest.from_dict(request_payload)
     order = await repo.submit_order(req)
     return {"ok": True, "order": order}
 
 
-async def _handle_cancel_order(
-    message: dict[str, Any],
-    auth_token: str,
-    auth,
-    repo: OrderRepository,
-) -> dict[str, Any]:
-    if not await auth.validate(auth_token):
-        return {"ok": False, "error": "unauthorized"}
-
+async def _handle_cancel_order(message: dict[str, Any], auth_token: str, auth, repo: OrderRepository) -> dict[str, Any]:
+    await _ensure_auth(auth, auth_token)
     request_payload = message.get("request")
     if not isinstance(request_payload, dict):
-        return {"ok": False, "error": "request payload must be an object"}
-
+        raise SubmissionError("request payload must be an object")
     req = CancelOrderRequest.from_dict(request_payload)
     cancel = await repo.cancel_order(req)
     return {"ok": True, "cancel": cancel}
+
+
+async def _handle_repo_call(
+    *,
+    key: str,
+    fn,
+    message: dict[str, Any],
+    auth_token: str,
+    auth,
+) -> dict[str, Any]:
+    await _ensure_auth(auth, auth_token)
+    request_payload = message.get("request")
+    if request_payload is None:
+        request_payload = {}
+    if not isinstance(request_payload, dict):
+        raise SubmissionError("request payload must be an object")
+    result = await fn(request_payload)
+    return {"ok": True, key: result}
 
 
 async def handle_client(
@@ -72,10 +79,42 @@ async def handle_client(
 
                 if action == "ping":
                     response = {"ok": True, "pong": True}
+                elif action == "health":
+                    response = {"ok": True, "status": "healthy"}
+                elif action == "ready":
+                    response = {"ok": True, "ready": await repo.ready()}
                 elif action == "submit_order":
                     response = await _handle_submit_order(message, auth_token, auth, repo)
                 elif action == "cancel_order":
                     response = await _handle_cancel_order(message, auth_token, auth, repo)
+                elif action == "get_order":
+                    response = await _handle_repo_call(key="order", fn=repo.get_order, message=message, auth_token=auth_token, auth=auth)
+                elif action == "list_orders":
+                    response = await _handle_repo_call(key="result", fn=repo.list_orders, message=message, auth_token=auth_token, auth=auth)
+                elif action == "list_open_orders":
+                    response = await _handle_repo_call(key="result", fn=repo.list_open_orders, message=message, auth_token=auth_token, auth=auth)
+                elif action == "cancel_all_orders":
+                    response = await _handle_repo_call(key="result", fn=repo.cancel_all_orders, message=message, auth_token=auth_token, auth=auth)
+                elif action == "replace_order":
+                    response = await _handle_repo_call(key="result", fn=repo.replace_order, message=message, auth_token=auth_token, auth=auth)
+                elif action == "get_trades":
+                    response = await _handle_repo_call(key="result", fn=repo.get_trades, message=message, auth_token=auth_token, auth=auth)
+                elif action == "get_positions":
+                    response = await _handle_repo_call(key="result", fn=repo.get_positions, message=message, auth_token=auth_token, auth=auth)
+                elif action == "get_account_balances":
+                    response = await _handle_repo_call(key="result", fn=repo.get_account_balances, message=message, auth_token=auth_token, auth=auth)
+                elif action == "deposit_cash":
+                    response = await _handle_repo_call(key="result", fn=repo.deposit_cash, message=message, auth_token=auth_token, auth=auth)
+                elif action == "withdraw_cash":
+                    response = await _handle_repo_call(key="result", fn=repo.withdraw_cash, message=message, auth_token=auth_token, auth=auth)
+                elif action == "create_market":
+                    response = await _handle_repo_call(key="result", fn=repo.create_market, message=message, auth_token=auth_token, auth=auth)
+                elif action == "update_market_status":
+                    response = await _handle_repo_call(key="result", fn=repo.update_market_status, message=message, auth_token=auth_token, auth=auth)
+                elif action == "resolve_market":
+                    response = await _handle_repo_call(key="result", fn=repo.resolve_market, message=message, auth_token=auth_token, auth=auth)
+                elif action == "get_order_book":
+                    response = await _handle_repo_call(key="result", fn=repo.get_order_book, message=message, auth_token=auth_token, auth=auth)
                 else:
                     response = {"ok": False, "error": f"unsupported action: {action}"}
             except (json.JSONDecodeError, UnicodeDecodeError):

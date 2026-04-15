@@ -39,3 +39,4 @@ ENC_TOKEN="$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.env
 DB_DSN="postgresql://admin:${ENC_TOKEN}@${HOST}:5432/postgres?sslmode=require"
 
 python "$ROOT_DIR/test/system_test.py" --db-dsn "$DB_DSN" --auth-token "$AUTH_TOKEN"
+python "$ROOT_DIR/test/rpc_features_test.py" --db-dsn "$DB_DSN" --auth-token "$AUTH_TOKEN"
