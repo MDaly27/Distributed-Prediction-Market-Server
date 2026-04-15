@@ -65,6 +65,26 @@ def _build_submit_message(
     return (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _build_cancel_message(
+    auth_token: str,
+    cancel_id: str,
+    order_id: str,
+    account_id: str,
+    reason: str,
+) -> bytes:
+    msg = {
+        "action": "cancel_order",
+        "auth_token": auth_token,
+        "request": {
+            "cancel_id": cancel_id,
+            "order_id": order_id,
+            "account_id": account_id,
+            "reason": reason,
+        },
+    }
+    return (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 async def _send_tcp_json(host: str, port: int, payload: bytes) -> dict:
     reader, writer = await asyncio.open_connection(host, port)
     try:
@@ -328,6 +348,42 @@ async def _run_test(args: argparse.Namespace) -> None:
 
         await asyncio.sleep(args.match_wait_seconds)
 
+        cancel_id = _uuid()
+        cancel_resp = await _send_tcp_json(
+            args.listener_host,
+            args.listener_port_b,
+            _build_cancel_message(
+                args.auth_token,
+                cancel_id=cancel_id,
+                order_id=order_ids["m3_no_open"],
+                account_id=a_no,
+                reason="system-test-cancel-open-order",
+            ),
+        )
+        if not cancel_resp.get("ok"):
+            raise AssertionError(f"cancel request failed: {cancel_resp}")
+        cancel_info = cancel_resp.get("cancel", {})
+        if cancel_info.get("status") != "CANCELLED":
+            raise AssertionError(f"unexpected cancel status: {cancel_resp}")
+        if int(cancel_info.get("unlocked_cash_cents", -1)) != 20:
+            raise AssertionError(f"unexpected cancel unlock amount: {cancel_resp}")
+
+        cancel_retry_resp = await _send_tcp_json(
+            args.listener_host,
+            args.listener_port_b,
+            _build_cancel_message(
+                args.auth_token,
+                cancel_id=cancel_id,
+                order_id=order_ids["m3_no_open"],
+                account_id=a_no,
+                reason="retry-same-cancel-id",
+            ),
+        )
+        if not cancel_retry_resp.get("ok"):
+            raise AssertionError(f"idempotent cancel retry failed: {cancel_retry_resp}")
+        if not cancel_retry_resp.get("cancel", {}).get("idempotent"):
+            raise AssertionError(f"cancel retry should be idempotent: {cancel_retry_resp}")
+
         async with pool.acquire() as conn:
             all_order_ids = list(order_ids.values())
             all_oids = _uuid_csv(all_order_ids)
@@ -344,7 +400,7 @@ async def _run_test(args: argparse.Namespace) -> None:
                 order_ids["m2_yes_cross"]: (0, "FILLED"),
                 order_ids["m2_no_cross"]: (0, "FILLED"),
                 order_ids["m3_yes_open"]: (1, "ACCEPTED"),
-                order_ids["m3_no_open"]: (1, "ACCEPTED"),
+                order_ids["m3_no_open"]: (0, "CANCELLED"),
             }
             for req_id, exp in expected.items():
                 got = state.get(req_id)
@@ -365,8 +421,31 @@ async def _run_test(args: argparse.Namespace) -> None:
                   AND remaining_qty > 0
                 """,
             )
-            if int(open_count) != 4:
-                raise AssertionError(f"expected 4 open unmatched/partial orders, got {open_count}")
+            if int(open_count) != 3:
+                raise AssertionError(f"expected 3 open unmatched/partial orders after cancel, got {open_count}")
+
+            cancel_rows = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM order_cancels
+                WHERE cancel_id = $1
+                """,
+                cancel_id,
+            )
+            if int(cancel_rows) != 1:
+                raise AssertionError(f"expected one cancel event row, got {cancel_rows}")
+
+            unlock_rows = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM ledger_entries
+                WHERE order_id = $1
+                  AND reason = 'ORDER_UNLOCK'
+                """,
+                order_ids["m3_no_open"],
+            )
+            if int(unlock_rows) != 1:
+                raise AssertionError(f"expected one ORDER_UNLOCK ledger entry, got {unlock_rows}")
 
             await conn.execute(f"UPDATE markets SET status='RESOLVED', resolve_time=now() - interval '1 minute' WHERE market_id IN ({_uuid_csv([m1, m2])})")
             await conn.execute(
@@ -419,8 +498,8 @@ async def _run_test(args: argparse.Namespace) -> None:
                 """,
                 m3,
             )
-            if int(m3_open) != 2:
-                raise AssertionError(f"expected 2 open orders in unresolved market m3, got {m3_open}")
+            if int(m3_open) != 1:
+                raise AssertionError(f"expected 1 open order in unresolved market m3 after cancel, got {m3_open}")
 
         print("SYSTEM TEST PASSED")
 

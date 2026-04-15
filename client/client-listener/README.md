@@ -31,6 +31,21 @@ Each TCP message is one JSON object ending in `\n`.
 }
 ```
 
+### Cancel order
+
+```json
+{
+  "action":"cancel_order",
+  "auth_token":"replace-with-token",
+  "request":{
+    "cancel_id":"9d87ec16-35de-40e4-b97f-85a5cb2faf89",
+    "order_id":"3de2e1e8-6bbd-4ca5-8fe2-b5372faf9d8c",
+    "account_id":"f478e3e1-33dc-4fb8-a3ef-b4f426e8c13f",
+    "reason":"user requested cancel"
+  }
+}
+```
+
 ## Auth
 
 Default mode is a static shared token.

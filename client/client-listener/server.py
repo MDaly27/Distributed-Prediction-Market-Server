@@ -7,7 +7,7 @@ from typing import Any
 from auth import AuthError, build_authenticator
 from config import load_settings
 from db import OrderRepository, SubmissionError, create_pool
-from models import SubmitOrderRequest, ValidationError
+from models import CancelOrderRequest, SubmitOrderRequest, ValidationError
 
 
 def _json_response(payload: dict[str, Any]) -> bytes:
@@ -30,6 +30,24 @@ async def _handle_submit_order(
     req = SubmitOrderRequest.from_dict(request_payload)
     order = await repo.submit_order(req)
     return {"ok": True, "order": order}
+
+
+async def _handle_cancel_order(
+    message: dict[str, Any],
+    auth_token: str,
+    auth,
+    repo: OrderRepository,
+) -> dict[str, Any]:
+    if not await auth.validate(auth_token):
+        return {"ok": False, "error": "unauthorized"}
+
+    request_payload = message.get("request")
+    if not isinstance(request_payload, dict):
+        return {"ok": False, "error": "request payload must be an object"}
+
+    req = CancelOrderRequest.from_dict(request_payload)
+    cancel = await repo.cancel_order(req)
+    return {"ok": True, "cancel": cancel}
 
 
 async def handle_client(
@@ -56,6 +74,8 @@ async def handle_client(
                     response = {"ok": True, "pong": True}
                 elif action == "submit_order":
                     response = await _handle_submit_order(message, auth_token, auth, repo)
+                elif action == "cancel_order":
+                    response = await _handle_cancel_order(message, auth_token, auth, repo)
                 else:
                     response = {"ok": False, "error": f"unsupported action: {action}"}
             except (json.JSONDecodeError, UnicodeDecodeError):

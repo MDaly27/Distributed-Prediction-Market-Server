@@ -53,3 +53,38 @@ class SubmitOrderRequest:
         if model.ingress_ts_ns <= 0:
             raise ValidationError("ingress_ts_ns must be > 0")
         return model
+
+
+@dataclass(frozen=True)
+class CancelOrderRequest:
+    cancel_id: str
+    order_id: str
+    account_id: str
+    reason: str | None
+
+    @staticmethod
+    def from_dict(payload: dict[str, Any]) -> "CancelOrderRequest":
+        try:
+            reason_raw = payload.get("reason")
+            model = CancelOrderRequest(
+                cancel_id=str(payload["cancel_id"]),
+                order_id=str(payload["order_id"]),
+                account_id=str(payload["account_id"]),
+                reason=None if reason_raw is None else str(reason_raw),
+            )
+        except KeyError as exc:
+            raise ValidationError(f"missing required field: {exc.args[0]}") from exc
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"invalid field type: {exc}") from exc
+
+        try:
+            UUID(model.cancel_id)
+            UUID(model.order_id)
+            UUID(model.account_id)
+        except ValueError as exc:
+            raise ValidationError(f"invalid UUID field: {exc}") from exc
+
+        if model.reason is not None and len(model.reason) > 1024:
+            raise ValidationError("reason must be at most 1024 characters")
+
+        return model
