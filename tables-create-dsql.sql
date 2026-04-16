@@ -18,11 +18,40 @@ CREATE TABLE IF NOT EXISTS accounts (
     available_cash_cents BIGINT NOT NULL DEFAULT 0 CHECK (available_cash_cents >= 0),
     locked_cash_cents BIGINT NOT NULL DEFAULT 0 CHECK (locked_cash_cents >= 0),
 
+    password_hash TEXT,
+    password_salt TEXT,
+    password_iterations INTEGER CHECK (password_iterations IS NULL OR password_iterations > 0),
+    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_hash TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_salt TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS password_iterations INTEGER;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_admin BOOLEAN;
+
 CREATE INDEX ASYNC IF NOT EXISTS accounts_status_idx ON accounts(status);
+CREATE INDEX ASYNC IF NOT EXISTS accounts_username_idx ON accounts(username);
+
+
+-- =========================================================
+-- 1a. Account auth sessions
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS account_auth_sessions (
+    session_id UUID PRIMARY KEY,
+    account_id UUID NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ASYNC IF NOT EXISTS account_auth_sessions_account_idx ON account_auth_sessions(account_id);
+CREATE INDEX ASYNC IF NOT EXISTS account_auth_sessions_expires_idx ON account_auth_sessions(expires_at);
 
 
 -- =========================================================

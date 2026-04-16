@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+.venv-test/
+.venv-pm/
+test/.logs/

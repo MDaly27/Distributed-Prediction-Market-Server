@@ -83,10 +83,18 @@ class ExecutionRepository:
                 FROM markets m
                 JOIN market_resolutions mr ON mr.market_id = m.market_id
                 LEFT JOIN market_settlement_runs msr ON msr.market_id = m.market_id
+                LEFT JOIN execution_market_leases l ON l.market_id = m.market_id
                 WHERE m.status = 'RESOLVED'
                   AND (m.resolve_time IS NULL OR m.resolve_time <= now())
                   AND (msr.market_id IS NULL OR msr.status != 'COMPLETED')
-                ORDER BY coalesce(m.resolve_time, mr.resolved_at), mr.resolved_at
+                ORDER BY
+                  CASE
+                    WHEN l.market_id IS NULL OR l.lease_expires_at < now() THEN 0
+                    ELSE 1
+                  END,
+                  COALESCE(l.updated_at, TIMESTAMPTZ 'epoch') ASC,
+                  COALESCE(m.resolve_time, mr.resolved_at) ASC,
+                  mr.resolved_at ASC
                 LIMIT $1
                 """,
                 limit,
@@ -102,30 +110,41 @@ class ExecutionRepository:
         owner_id: str,
         lease_seconds: int,
     ) -> bool:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO execution_market_leases (
-                    market_id,
-                    owner_id,
-                    lease_expires_at,
-                    updated_at
-                )
-                VALUES ($1, $2, now() + ($3::text || ' seconds')::interval, now())
-                ON CONFLICT (market_id)
-                DO UPDATE
-                SET owner_id = EXCLUDED.owner_id,
-                    lease_expires_at = EXCLUDED.lease_expires_at,
-                    updated_at = now()
-                WHERE execution_market_leases.lease_expires_at < now()
-                   OR execution_market_leases.owner_id = EXCLUDED.owner_id
-                RETURNING owner_id
-                """,
-                market_id,
-                owner_id,
-                f"{lease_seconds} seconds",
-            )
-            return bool(row and row["owner_id"] == owner_id)
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self.pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO execution_market_leases (
+                            market_id,
+                            owner_id,
+                            lease_expires_at,
+                            updated_at
+                        )
+                        VALUES ($1, $2, now() + ($3::text || ' seconds')::interval, now())
+                        ON CONFLICT (market_id)
+                        DO UPDATE
+                        SET owner_id = EXCLUDED.owner_id,
+                            lease_expires_at = EXCLUDED.lease_expires_at,
+                            updated_at = now()
+                        WHERE execution_market_leases.lease_expires_at < now()
+                           OR execution_market_leases.owner_id = EXCLUDED.owner_id
+                        RETURNING owner_id
+                        """,
+                        market_id,
+                        owner_id,
+                        f"{lease_seconds} seconds",
+                    )
+                    return bool(row and row["owner_id"] == owner_id)
+            except asyncpg.PostgresError as exc:
+                if not _is_occ_error(exc):
+                    raise
+                if attempt == max_attempts:
+                    return False
+                delay = (0.02 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.02)
+                await asyncio.sleep(delay)
+        return False
 
     async def execute_settlement(self, market_id: str, owner_id: str) -> int:
         max_attempts = 5

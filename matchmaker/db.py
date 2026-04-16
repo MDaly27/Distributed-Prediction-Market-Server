@@ -63,12 +63,19 @@ class MatchRepository:
                 SELECT o.market_id
                 FROM orders o
                 JOIN markets m ON m.market_id = o.market_id
+                LEFT JOIN matchmaker_market_leases l ON l.market_id = o.market_id
                 WHERE o.status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
                   AND o.remaining_qty > 0
                   AND m.status = 'ACTIVE'
                   AND (m.close_time IS NULL OR m.close_time > now())
-                GROUP BY o.market_id
-                ORDER BY min(o.global_seq)
+                GROUP BY o.market_id, l.market_id, l.lease_expires_at, l.updated_at
+                ORDER BY
+                  CASE
+                    WHEN l.market_id IS NULL OR l.lease_expires_at < now() THEN 0
+                    ELSE 1
+                  END,
+                  COALESCE(l.updated_at, TIMESTAMPTZ 'epoch') ASC,
+                  min(o.global_seq) ASC
                 LIMIT $1
                 """,
                 limit,
@@ -81,30 +88,41 @@ class MatchRepository:
         owner_id: str,
         lease_seconds: int,
     ) -> bool:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO matchmaker_market_leases (
-                    market_id,
-                    owner_id,
-                    lease_expires_at,
-                    updated_at
-                )
-                VALUES ($1, $2, now() + ($3::text || ' seconds')::interval, now())
-                ON CONFLICT (market_id)
-                DO UPDATE
-                SET owner_id = EXCLUDED.owner_id,
-                    lease_expires_at = EXCLUDED.lease_expires_at,
-                    updated_at = now()
-                WHERE matchmaker_market_leases.lease_expires_at < now()
-                   OR matchmaker_market_leases.owner_id = EXCLUDED.owner_id
-                RETURNING owner_id
-                """,
-                market_id,
-                owner_id,
-                f"{lease_seconds} seconds",
-            )
-            return bool(row and row["owner_id"] == owner_id)
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self.pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO matchmaker_market_leases (
+                            market_id,
+                            owner_id,
+                            lease_expires_at,
+                            updated_at
+                        )
+                        VALUES ($1, $2, now() + ($3::text || ' seconds')::interval, now())
+                        ON CONFLICT (market_id)
+                        DO UPDATE
+                        SET owner_id = EXCLUDED.owner_id,
+                            lease_expires_at = EXCLUDED.lease_expires_at,
+                            updated_at = now()
+                        WHERE matchmaker_market_leases.lease_expires_at < now()
+                           OR matchmaker_market_leases.owner_id = EXCLUDED.owner_id
+                        RETURNING owner_id
+                        """,
+                        market_id,
+                        owner_id,
+                        f"{lease_seconds} seconds",
+                    )
+                    return bool(row and row["owner_id"] == owner_id)
+            except asyncpg.PostgresError as exc:
+                if not _is_occ_error(exc):
+                    raise
+                if attempt == max_attempts:
+                    return False
+                delay = (0.02 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.02)
+                await asyncio.sleep(delay)
+        return False
 
     async def load_market_orders(self, market_id: str, limit: int) -> list[Order]:
         async with self.pool.acquire() as conn:
