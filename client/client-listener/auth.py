@@ -10,9 +10,29 @@ class AuthError(Exception):
 
 
 class Authenticator(ABC):
+    """Protocol for validating bearer tokens presented by connecting clients.
+
+    Concrete implementations are selected by :func:`build_authenticator`
+    based on ``settings.auth_mode`` and are consumed by the client-listener
+    server (see ``server._ensure_auth``).
+
+    Contract for :meth:`validate`:
+
+    * Returns ``True`` iff ``token`` is a valid, currently-accepted
+      credential. Returns ``False`` for any invalid, empty, or malformed
+      token -- it must not raise in that case.
+    * Implementations must use a constant-time comparison
+      (e.g. :func:`hmac.compare_digest`) when checking token equality, to
+      avoid leaking information via timing side-channels.
+    * May raise :class:`AuthError` only for backend/infrastructure
+      failures that prevent the authenticator from making a decision
+      (e.g. a secret store is unreachable). Simple "bad token" outcomes
+      must be reported as ``False``, not as an exception.
+    """
+
     @abstractmethod
     async def validate(self, token: str) -> bool:
-        raise NotImplementedError
+        ...
 
 
 class StaticTokenAuthenticator(Authenticator):
