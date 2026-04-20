@@ -9,7 +9,27 @@ from models import Order
 
 
 class MatchError(Exception):
-    pass
+    """Raised when a match cannot be executed against the database.
+
+    Surfaced by :meth:`MatchRepository.execute_match` when optimistic
+    concurrency retries are exhausted or a non-retryable database error
+    occurs. Callers should treat this as a transient failure for the
+    specific market and continue scanning other candidate markets.
+
+    The optional ``market_id`` attribute records which market the failed
+    match belonged to, which is the most useful diagnostic context for a
+    matcher that services many markets concurrently.
+    """
+
+    def __init__(self, message: str, *, market_id: str | None = None) -> None:
+        super().__init__(message)
+        self.market_id = market_id
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        if self.market_id is not None:
+            return f"{base} (market_id={self.market_id})"
+        return base
 
 
 class RetryableOCCError(Exception):
@@ -167,7 +187,9 @@ class MatchRepository:
                 return await self._execute_match_once(market_id, yes_order_id, no_order_id, qty)
             except RetryableOCCError:
                 if attempt == max_attempts:
-                    raise MatchError("database conflict after retries")
+                    raise MatchError(
+                        "database conflict after retries", market_id=market_id
+                    )
                 delay = (0.02 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.02)
                 await asyncio.sleep(delay)
 
@@ -399,4 +421,4 @@ class MatchRepository:
         except asyncpg.PostgresError as exc:
             if _is_occ_error(exc):
                 raise RetryableOCCError from exc
-            raise MatchError(f"database error: {exc}") from exc
+            raise MatchError(f"database error: {exc}", market_id=market_id) from exc
