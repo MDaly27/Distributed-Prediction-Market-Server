@@ -40,7 +40,17 @@ esac
 
 echo "==> installing apt packages"
 apt-get update -y
-apt-get install -y python3-venv python3-pip awscli git postgresql-client jq
+apt-get install -y python3-venv python3-pip git postgresql-client jq unzip curl
+
+# AWS CLI v2 is required for `aws dsql ...`. apt's awscli is v1 and lacks it,
+# so we always install v2 from the official zip even if v1 is already there.
+if ! /usr/local/bin/aws --version 2>/dev/null | grep -q '^aws-cli/2'; then
+  echo "==> installing AWS CLI v2"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -qo /tmp/awscliv2.zip -d /tmp/
+  /tmp/aws/install --update --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli
+fi
+/usr/local/bin/aws --version
 
 echo "==> ensuring user '${APP_USER}' exists"
 if ! id "${APP_USER}" >/dev/null 2>&1; then

@@ -1876,7 +1876,7 @@ class OrderRepository:
             if str(order_row["account_id"]) != account_id:
                 raise SubmissionError("order does not belong to account")
             if order_row["status"] not in OPEN_ORDER_STATUSES:
-                raise SubmissionError(f"order status is {order_row["status"]}, not cancellable")
+                raise SubmissionError(f"order status is {order_row['status']}, not cancellable")
             if int(order_row["remaining_qty"]) <= 0:
                 raise SubmissionError("order has no remaining quantity to cancel")
 
