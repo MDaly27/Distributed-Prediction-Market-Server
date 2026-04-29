@@ -39,6 +39,41 @@ def _uuid_csv(values: list[str]) -> str:
     return ", ".join(f"'{value}'::uuid" for value in values)
 
 
+# Must agree with the listener / matchmaker / executor ACCOUNT_CASH_BUCKETS.
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _split_amount(amount_cents: int, n: int) -> list[int]:
+    base, rem = divmod(amount_cents, n)
+    out = [base] * n
+    out[0] += rem
+    return out
+
+
+async def _reseed_account_cash_buckets(
+    conn: asyncpg.Connection, account_id: str, available_cents: int, locked_cents: int = 0
+) -> None:
+    avail_split = _split_amount(available_cents, ACCOUNT_CASH_BUCKETS)
+    locked_split = _split_amount(locked_cents, ACCOUNT_CASH_BUCKETS)
+    for b in range(ACCOUNT_CASH_BUCKETS):
+        await conn.execute(
+            """
+            INSERT INTO account_cash_buckets (
+                account_id, bucket_id, available_cash_cents, locked_cash_cents
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (account_id, bucket_id) DO UPDATE
+            SET available_cash_cents = EXCLUDED.available_cash_cents,
+                locked_cash_cents    = EXCLUDED.locked_cash_cents,
+                updated_at = now()
+            """,
+            account_id,
+            b,
+            avail_split[b],
+            locked_split[b],
+        )
+
+
 async def _send_tcp_json(host: str, port: int, payload: dict) -> dict:
     reader, writer = await asyncio.open_connection(host, port)
     try:
@@ -144,12 +179,14 @@ async def _cleanup(conn: asyncpg.Connection, market_ids: list[str], account_ids:
         await conn.execute(f"DELETE FROM orders WHERE market_id IN ({m_ids})")
         await conn.execute(f"DELETE FROM execution_market_leases WHERE market_id IN ({m_ids})")
         await conn.execute(f"DELETE FROM matchmaker_market_leases WHERE market_id IN ({m_ids})")
+        await conn.execute(f"DELETE FROM match_work_queue WHERE market_id IN ({m_ids})")
         await conn.execute(f"DELETE FROM markets WHERE market_id IN ({m_ids})")
     if account_ids:
         a_ids = _uuid_csv(account_ids)
         await conn.execute(f"DELETE FROM ledger_entries WHERE account_id IN ({a_ids})")
         await conn.execute(f"DELETE FROM cash_transactions WHERE account_id IN ({a_ids})")
         await conn.execute(f"DELETE FROM account_auth_sessions WHERE account_id IN ({a_ids})")
+        await conn.execute(f"DELETE FROM account_cash_buckets WHERE account_id IN ({a_ids})")
         await conn.execute(f"DELETE FROM accounts WHERE account_id IN ({a_ids})")
 
 
@@ -200,8 +237,10 @@ async def _run_test(args: argparse.Namespace) -> None:
 
         async with pool.acquire() as conn:
             await conn.execute("UPDATE accounts SET is_admin = TRUE, available_cash_cents = 300000, updated_at = now() WHERE account_id = $1", accounts["admin"].account_id)
+            await _reseed_account_cash_buckets(conn, accounts["admin"].account_id, 300000)
             for name in ["user1", "user2"]:
                 await conn.execute("UPDATE accounts SET available_cash_cents = 300000, updated_at = now() WHERE account_id = $1", accounts[name].account_id)
+                await _reseed_account_cash_buckets(conn, accounts[name].account_id, 300000)
             await conn.execute(
                 """
                 INSERT INTO markets (

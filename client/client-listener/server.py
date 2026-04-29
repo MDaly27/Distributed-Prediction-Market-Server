@@ -1,5 +1,9 @@
 import asyncio
 import json
+import multiprocessing
+import os
+import signal
+import sys
 import traceback
 from datetime import datetime, timezone
 from typing import Any
@@ -7,6 +11,7 @@ from typing import Any
 from auth import AuthError, build_authenticator
 from config import load_settings
 from db import OrderRepository, SubmissionError, create_pool
+from metrics import METRICS, serve_metrics
 from models import CancelOrderRequest, SubmitOrderRequest, ValidationError
 
 
@@ -146,7 +151,7 @@ async def handle_client(
         print(f'[{datetime.now(timezone.utc).isoformat()}] disconnected: {peer}')
 
 
-async def main() -> None:
+async def _serve_one_worker(worker_index: int) -> None:
     settings = load_settings()
     try:
         auth = build_authenticator(settings)
@@ -167,13 +172,101 @@ async def main() -> None:
         lambda r, w: handle_client(r, w, auth=auth, repo=repo),
         settings.host,
         settings.port,
+        reuse_port=settings.workers > 1,
     )
     sockets = ', '.join(str(sock.getsockname()) for sock in (server.sockets or []))
-    print(f'client-listener running on {sockets}')
+    pid = os.getpid()
+    print(f'client-listener worker pid={pid} index={worker_index} running on {sockets}')
 
-    async with server:
-        await server.serve_forever()
+    metrics_server = None
+    if settings.metrics_port > 0:
+        metrics_port = settings.metrics_port + worker_index
+        try:
+            metrics_server = await serve_metrics(settings.metrics_host, metrics_port)
+            print(f'client-listener metrics worker={worker_index} on {settings.metrics_host}:{metrics_port}')
+        except OSError as exc:
+            print(f'client-listener metrics failed to bind worker={worker_index} port={metrics_port}: {exc}')
+
+    async def _pool_gauge_loop():
+        while True:
+            try:
+                if hasattr(pool, "get_size") and hasattr(pool, "get_idle_size"):
+                    METRICS.set_gauge("listener_pool_size", float(pool.get_size()))
+                    METRICS.set_gauge("listener_pool_idle", float(pool.get_idle_size()))
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+
+    pool_gauge_task = asyncio.create_task(_pool_gauge_loop())
+
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        pool_gauge_task.cancel()
+        if metrics_server is not None:
+            metrics_server.close()
+            try:
+                await metrics_server.wait_closed()
+            except Exception:
+                pass
+
+
+def _worker_entry(worker_index: int) -> None:
+    try:
+        asyncio.run(_serve_one_worker(worker_index))
+    except KeyboardInterrupt:
+        pass
+
+
+async def main() -> None:
+    await _serve_one_worker(0)
+
+
+def _run_multi_worker(settings) -> None:
+    ctx = multiprocessing.get_context('spawn')
+    procs: list[multiprocessing.Process] = []
+
+    def _shutdown(signum, _frame) -> None:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _shutdown)
+
+    for i in range(settings.workers):
+        proc = ctx.Process(target=_worker_entry, args=(i,), name=f'listener-worker-{i}')
+        proc.daemon = False
+        proc.start()
+        procs.append(proc)
+
+    print(f'client-listener parent pid={os.getpid()} forked {settings.workers} workers')
+
+    exit_code = 0
+    try:
+        while procs:
+            for proc in list(procs):
+                proc.join(timeout=0.5)
+                if not proc.is_alive():
+                    if proc.exitcode and proc.exitcode != 0:
+                        exit_code = proc.exitcode
+                    procs.remove(proc)
+                    # Tear down siblings; supervisor will restart the group.
+                    for other in procs:
+                        if other.is_alive():
+                            other.terminate()
+    except KeyboardInterrupt:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+
+    sys.exit(exit_code)
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    settings = load_settings()
+    if settings.workers > 1:
+        _run_multi_worker(settings)
+    else:
+        asyncio.run(main())

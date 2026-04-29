@@ -5,7 +5,28 @@ from datetime import datetime, timezone
 
 import asyncpg
 
+from metrics import METRICS
 from models import Order
+
+
+# Must agree with client/client-listener/db.py ACCOUNT_CASH_BUCKETS.
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _bucket_for_uuid(value: str) -> int:
+    try:
+        return int(uuid.UUID(value).int) % ACCOUNT_CASH_BUCKETS
+    except Exception:
+        return abs(hash(value)) % ACCOUNT_CASH_BUCKETS
+
+
+def _market_shard(market_id: str, total_instances: int) -> int:
+    if total_instances <= 1:
+        return 0
+    try:
+        return int(uuid.UUID(market_id).int) % total_instances
+    except Exception:
+        return abs(hash(market_id)) % total_instances
 
 
 class MatchError(Exception):
@@ -75,32 +96,129 @@ class MatchRepository:
                 ON matchmaker_market_leases(lease_expires_at)
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS match_work_queue (
+                    market_id UUID PRIMARY KEY,
+                    queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX ASYNC IF NOT EXISTS match_work_queue_queued_idx
+                ON match_work_queue(queued_at)
+                """
+            )
 
-    async def list_candidate_markets(self, limit: int) -> list[str]:
+    async def claim_pending_markets(
+        self,
+        limit: int,
+        *,
+        instance_index: int = 0,
+        total_instances: int = 1,
+    ) -> list[str]:
+        if total_instances <= 0:
+            total_instances = 1
+        if limit <= 0:
+            return []
+        async with self.pool.acquire() as conn:
+            # Over-fetch so the shard filter still has enough rows to work with.
+            over_fetch = max(limit * max(1, total_instances), limit)
+            rows = await conn.fetch(
+                """
+                SELECT market_id
+                FROM match_work_queue
+                ORDER BY queued_at
+                LIMIT $1
+                """,
+                over_fetch,
+            )
+            mine: list[str] = []
+            for r in rows:
+                mid = str(r["market_id"])
+                if total_instances == 1 or _market_shard(mid, total_instances) == instance_index:
+                    mine.append(mid)
+                    if len(mine) >= limit:
+                        break
+            if not mine:
+                METRICS.set_gauge("matchmaker_queue_depth_sample", float(len(rows)))
+                return []
+            # IN-list with positional placeholders avoids asyncpg's array
+            # type introspection, which DSQL rejects (it tries SET jit=off).
+            placeholders = ",".join(f"${i + 1}::uuid" for i in range(len(mine)))
+            deleted = await conn.fetch(
+                f"""
+                DELETE FROM match_work_queue
+                WHERE market_id IN ({placeholders})
+                RETURNING market_id, queued_at
+                """,
+                *mine,
+            )
+            METRICS.incr("matchmaker_claimed_markets_total", float(len(deleted)))
+            METRICS.set_gauge("matchmaker_queue_depth_sample", float(len(rows)))
+            now = datetime.now(timezone.utc)
+            max_lag_ms = 0.0
+            for r in deleted:
+                qd = r["queued_at"]
+                lag_ms = (now - qd).total_seconds() * 1000.0 if qd else 0.0
+                if lag_ms > max_lag_ms:
+                    max_lag_ms = lag_ms
+            METRICS.set_gauge("matchmaker_queue_max_lag_ms", max_lag_ms)
+            return [str(r["market_id"]) for r in deleted]
+
+    async def requeue_market(self, market_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO match_work_queue (market_id, queued_at)
+                VALUES ($1, now())
+                ON CONFLICT (market_id) DO NOTHING
+                """,
+                market_id,
+            )
+
+    async def requeue_unmatched_markets(
+        self,
+        limit: int,
+        *,
+        instance_index: int = 0,
+        total_instances: int = 1,
+    ) -> int:
+        # Safety net for queue entries lost to a matcher crash.
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT o.market_id
+                SELECT DISTINCT o.market_id
                 FROM orders o
                 JOIN markets m ON m.market_id = o.market_id
-                LEFT JOIN matchmaker_market_leases l ON l.market_id = o.market_id
+                LEFT JOIN match_work_queue q ON q.market_id = o.market_id
                 WHERE o.status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
                   AND o.remaining_qty > 0
                   AND m.status = 'ACTIVE'
                   AND (m.close_time IS NULL OR m.close_time > now())
-                GROUP BY o.market_id, l.market_id, l.lease_expires_at, l.updated_at
-                ORDER BY
-                  CASE
-                    WHEN l.market_id IS NULL OR l.lease_expires_at < now() THEN 0
-                    ELSE 1
-                  END,
-                  COALESCE(l.updated_at, TIMESTAMPTZ 'epoch') ASC,
-                  min(o.global_seq) ASC
+                  AND q.market_id IS NULL
                 LIMIT $1
                 """,
-                limit,
+                limit * max(1, total_instances),
             )
-            return [str(r["market_id"]) for r in rows]
+            inserted = 0
+            for r in rows:
+                mid = str(r["market_id"])
+                if total_instances > 1 and _market_shard(mid, total_instances) != instance_index:
+                    continue
+                result = await conn.execute(
+                    """
+                    INSERT INTO match_work_queue (market_id, queued_at)
+                    VALUES ($1, now())
+                    ON CONFLICT (market_id) DO NOTHING
+                    """,
+                    mid,
+                )
+                if result.startswith("INSERT 0 1"):
+                    inserted += 1
+            METRICS.incr("matchmaker_requeued_markets_total", float(inserted))
+            return inserted
 
     async def try_acquire_market_lease(
         self,
@@ -224,7 +342,7 @@ class MatchRepository:
                     yes_row = await conn.fetchrow(
                         """
                         SELECT request_id, account_id, market_id, side, remaining_qty,
-                               price_cents, status, global_seq
+                               price_cents, status, global_seq, lock_bucket_id
                         FROM orders
                         WHERE request_id = $1
                         """,
@@ -233,7 +351,7 @@ class MatchRepository:
                     no_row = await conn.fetchrow(
                         """
                         SELECT request_id, account_id, market_id, side, remaining_qty,
-                               price_cents, status, global_seq
+                               price_cents, status, global_seq, lock_bucket_id
                         FROM orders
                         WHERE request_id = $1
                         """,
@@ -260,67 +378,77 @@ class MatchRepository:
 
                     yes_fill_cost = qty * yes_row["price_cents"]
                     no_fill_cost = qty * no_row["price_cents"]
+                    yes_bucket = (
+                        int(yes_row["lock_bucket_id"])
+                        if yes_row["lock_bucket_id"] is not None
+                        else _bucket_for_uuid(yes_order_id)
+                    )
+                    no_bucket = (
+                        int(no_row["lock_bucket_id"])
+                        if no_row["lock_bucket_id"] is not None
+                        else _bucket_for_uuid(no_order_id)
+                    )
 
-                    yes_account_update = await conn.execute(
+                    update_row = await conn.fetchrow(
                         """
-                        UPDATE accounts
-                        SET locked_cash_cents = locked_cash_cents - $2,
-                            updated_at = now()
-                        WHERE account_id = $1
-                          AND status = 'ACTIVE'
-                          AND locked_cash_cents >= $2
+                        WITH
+                          yes_bkt AS (
+                            UPDATE account_cash_buckets
+                            SET locked_cash_cents = locked_cash_cents - $2,
+                                updated_at = now()
+                            WHERE account_id = $1 AND bucket_id = $3
+                              AND locked_cash_cents >= $2
+                            RETURNING bucket_id
+                          ),
+                          no_bkt AS (
+                            UPDATE account_cash_buckets
+                            SET locked_cash_cents = locked_cash_cents - $5,
+                                updated_at = now()
+                            WHERE account_id = $4 AND bucket_id = $6
+                              AND locked_cash_cents >= $5
+                            RETURNING bucket_id
+                          ),
+                          yes_ord AS (
+                            UPDATE orders
+                            SET remaining_qty = remaining_qty - $8,
+                                status = CASE
+                                    WHEN remaining_qty - $8 = 0 THEN 'FILLED'
+                                    ELSE 'PARTIALLY_FILLED'
+                                END,
+                                updated_at = now()
+                            WHERE request_id = $7
+                              AND status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
+                              AND remaining_qty >= $8
+                            RETURNING request_id
+                          ),
+                          no_ord AS (
+                            UPDATE orders
+                            SET remaining_qty = remaining_qty - $8,
+                                status = CASE
+                                    WHEN remaining_qty - $8 = 0 THEN 'FILLED'
+                                    ELSE 'PARTIALLY_FILLED'
+                                END,
+                                updated_at = now()
+                            WHERE request_id = $9
+                              AND status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
+                              AND remaining_qty >= $8
+                            RETURNING request_id
+                          )
+                        SELECT
+                          EXISTS(SELECT 1 FROM yes_bkt) AS yes_bkt_ok,
+                          EXISTS(SELECT 1 FROM no_bkt)  AS no_bkt_ok,
+                          EXISTS(SELECT 1 FROM yes_ord) AS yes_ord_ok,
+                          EXISTS(SELECT 1 FROM no_ord)  AS no_ord_ok
                         """,
-                        yes_row["account_id"],
-                        yes_fill_cost,
+                        yes_row["account_id"], yes_fill_cost, yes_bucket,
+                        no_row["account_id"], no_fill_cost, no_bucket,
+                        yes_order_id, qty, no_order_id,
                     )
-                    no_account_update = await conn.execute(
-                        """
-                        UPDATE accounts
-                        SET locked_cash_cents = locked_cash_cents - $2,
-                            updated_at = now()
-                        WHERE account_id = $1
-                          AND status = 'ACTIVE'
-                          AND locked_cash_cents >= $2
-                        """,
-                        no_row["account_id"],
-                        no_fill_cost,
-                    )
-                    if yes_account_update != "UPDATE 1" or no_account_update != "UPDATE 1":
+                    if update_row is None:
+                        raise RetryableOCCError("match update returned no row")
+                    if not bool(update_row["yes_bkt_ok"]) or not bool(update_row["no_bkt_ok"]):
                         return False
-
-                    yes_order_update = await conn.execute(
-                        """
-                        UPDATE orders
-                        SET remaining_qty = remaining_qty - $2,
-                            status = CASE
-                                WHEN remaining_qty - $2 = 0 THEN 'FILLED'
-                                ELSE 'PARTIALLY_FILLED'
-                            END,
-                            updated_at = now()
-                        WHERE request_id = $1
-                          AND status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
-                          AND remaining_qty >= $2
-                        """,
-                        yes_order_id,
-                        qty,
-                    )
-                    no_order_update = await conn.execute(
-                        """
-                        UPDATE orders
-                        SET remaining_qty = remaining_qty - $2,
-                            status = CASE
-                                WHEN remaining_qty - $2 = 0 THEN 'FILLED'
-                                ELSE 'PARTIALLY_FILLED'
-                            END,
-                            updated_at = now()
-                        WHERE request_id = $1
-                          AND status IN ('ACCEPTED', 'OPEN', 'PARTIALLY_FILLED')
-                          AND remaining_qty >= $2
-                        """,
-                        no_order_id,
-                        qty,
-                    )
-                    if yes_order_update != "UPDATE 1" or no_order_update != "UPDATE 1":
+                    if not bool(update_row["yes_ord_ok"]) or not bool(update_row["no_ord_ok"]):
                         raise RetryableOCCError("order changed concurrently")
 
                     trade_id = str(uuid.uuid4())
@@ -330,66 +458,47 @@ class MatchRepository:
                         resting_order_id = no_order_id
                         aggressing_order_id = yes_order_id
 
-                    await conn.execute(
-                        """
-                        INSERT INTO trades (
-                            trade_id, market_id, resting_order_id, aggressing_order_id,
-                            qty, yes_price_cents
-                        )
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                        """,
-                        trade_id,
-                        market_id,
-                        resting_order_id,
-                        aggressing_order_id,
-                        qty,
-                        yes_row["price_cents"],
-                    )
+                    yes_entry_id = str(uuid.uuid4())
+                    no_entry_id = str(uuid.uuid4())
+                    yes_notes = f"Match execution for YES order {yes_order_id}"
+                    no_notes = f"Match execution for NO order {no_order_id}"
 
                     await conn.execute(
                         """
-                        INSERT INTO positions (account_id, market_id, yes_shares, no_shares, updated_at)
-                        VALUES ($1, $2, $3, 0, now())
-                        ON CONFLICT (account_id, market_id)
-                        DO UPDATE SET yes_shares = positions.yes_shares + EXCLUDED.yes_shares,
-                                      updated_at = now()
-                        """,
-                        yes_row["account_id"],
-                        market_id,
-                        qty,
-                    )
-                    await conn.execute(
-                        """
-                        INSERT INTO positions (account_id, market_id, yes_shares, no_shares, updated_at)
-                        VALUES ($1, $2, 0, $3, now())
-                        ON CONFLICT (account_id, market_id)
-                        DO UPDATE SET no_shares = positions.no_shares + EXCLUDED.no_shares,
-                                      updated_at = now()
-                        """,
-                        no_row["account_id"],
-                        market_id,
-                        qty,
-                    )
-
-                    await conn.execute(
-                        """
-                        INSERT INTO trade_parties (
-                            trade_id, account_id, role, side_acquired, qty, cash_delta_cents
-                        )
-                        VALUES
-                        ($1, $2, 'BUYER', 'YES', $3, $4),
-                        ($1, $5, 'BUYER', 'NO',  $3, $6)
-                        """,
-                        trade_id,
-                        yes_row["account_id"],
-                        qty,
-                        -yes_fill_cost,
-                        no_row["account_id"],
-                        -no_fill_cost,
-                    )
-
-                    await conn.execute(
-                        """
+                        WITH
+                          trade_ins AS (
+                            INSERT INTO trades (
+                                trade_id, market_id, resting_order_id, aggressing_order_id,
+                                qty, yes_price_cents
+                            )
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            RETURNING trade_id
+                          ),
+                          yes_pos AS (
+                            INSERT INTO positions (account_id, market_id, yes_shares, no_shares, updated_at)
+                            VALUES ($7, $2, $5, 0, now())
+                            ON CONFLICT (account_id, market_id) DO UPDATE
+                            SET yes_shares = positions.yes_shares + EXCLUDED.yes_shares,
+                                updated_at = now()
+                            RETURNING account_id
+                          ),
+                          no_pos AS (
+                            INSERT INTO positions (account_id, market_id, yes_shares, no_shares, updated_at)
+                            VALUES ($8, $2, 0, $5, now())
+                            ON CONFLICT (account_id, market_id) DO UPDATE
+                            SET no_shares = positions.no_shares + EXCLUDED.no_shares,
+                                updated_at = now()
+                            RETURNING account_id
+                          ),
+                          parties AS (
+                            INSERT INTO trade_parties (
+                                trade_id, account_id, role, side_acquired, qty, cash_delta_cents
+                            )
+                            VALUES
+                              ($1, $7, 'BUYER', 'YES', $5, $9),
+                              ($1, $8, 'BUYER', 'NO',  $5, $10)
+                            RETURNING trade_id
+                          )
                         INSERT INTO ledger_entries (
                             entry_id, account_id, market_id, order_id, trade_id,
                             cash_delta_cents, locked_cash_delta_cents,
@@ -398,23 +507,15 @@ class MatchRepository:
                             reason, notes
                         )
                         VALUES
-                        ($1, $2, $3, $4, $5, 0, $6, $7, 0, 0, 0, 'TRADE_EXECUTION', $8),
-                        ($9, $10, $3, $11, $5, 0, $12, 0, $13, 0, 0, 'TRADE_EXECUTION', $14)
+                          ($11, $7, $2, $12, $1, 0, $9, $5, 0, 0, 0, 'TRADE_EXECUTION', $13),
+                          ($14, $8, $2, $15, $1, 0, $10, 0, $5, 0, 0, 'TRADE_EXECUTION', $16)
                         """,
-                        str(uuid.uuid4()),
-                        yes_row["account_id"],
-                        market_id,
-                        yes_order_id,
-                        trade_id,
-                        -yes_fill_cost,
-                        qty,
-                        f"Match execution for YES order {yes_order_id}",
-                        str(uuid.uuid4()),
-                        no_row["account_id"],
-                        no_order_id,
-                        -no_fill_cost,
-                        qty,
-                        f"Match execution for NO order {no_order_id}",
+                        trade_id, market_id, resting_order_id, aggressing_order_id,
+                        qty, yes_row["price_cents"],
+                        yes_row["account_id"], no_row["account_id"],
+                        -yes_fill_cost, -no_fill_cost,
+                        yes_entry_id, yes_order_id, yes_notes,
+                        no_entry_id, no_order_id, no_notes,
                     )
 
                     return True

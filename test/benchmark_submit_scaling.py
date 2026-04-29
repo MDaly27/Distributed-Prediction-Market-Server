@@ -169,6 +169,16 @@ async def _create_market(conn: asyncpg.Connection, run_id: str, point_label: str
     return market_id
 
 
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _split_amount(amount_cents: int, n: int) -> list[int]:
+    base, rem = divmod(amount_cents, n)
+    out = [base] * n
+    out[0] += rem
+    return out
+
+
 async def _fund_accounts(conn: asyncpg.Connection, account_ids: list[str], amount_cents: int) -> None:
     if not account_ids:
         return
@@ -182,6 +192,24 @@ async def _fund_accounts(conn: asyncpg.Connection, account_ids: list[str], amoun
         WHERE account_id IN ({account_id_sql})
         """
     )
+    avail_split = _split_amount(int(amount_cents), ACCOUNT_CASH_BUCKETS)
+    for account_id in account_ids:
+        for b in range(ACCOUNT_CASH_BUCKETS):
+            await conn.execute(
+                """
+                INSERT INTO account_cash_buckets (
+                    account_id, bucket_id, available_cash_cents, locked_cash_cents
+                )
+                VALUES ($1, $2, $3, 0)
+                ON CONFLICT (account_id, bucket_id) DO UPDATE
+                SET available_cash_cents = EXCLUDED.available_cash_cents,
+                    locked_cash_cents    = 0,
+                    updated_at = now()
+                """,
+                account_id,
+                b,
+                avail_split[b],
+            )
 
 
 async def _delete_orders_for_markets(conn: asyncpg.Connection, market_ids: list[str]) -> None:
@@ -189,29 +217,45 @@ async def _delete_orders_for_markets(conn: asyncpg.Connection, market_ids: list[
         return
     for batch in _chunks(market_ids, 4):
         market_id_sql = _uuid_csv(batch)
-        await conn.execute(
-            f"DELETE FROM ledger_entries WHERE market_id IN ({market_id_sql})",
+        order_rows = await conn.fetch(
+            f"SELECT request_id FROM orders WHERE market_id IN ({market_id_sql})",
         )
-        await conn.execute(
-            f"DELETE FROM orders WHERE market_id IN ({market_id_sql})",
-        )
-        await conn.execute(
-            f"DELETE FROM markets WHERE market_id IN ({market_id_sql})",
-        )
+        order_ids = [str(row["request_id"]) for row in order_rows]
+        for order_batch in _chunks(order_ids, 100):
+            order_id_sql = _uuid_csv(order_batch)
+            async with conn.transaction():
+                await conn.execute(
+                    f"DELETE FROM ledger_entries WHERE order_id IN ({order_id_sql})",
+                )
+                await conn.execute(
+                    f"DELETE FROM orders WHERE request_id IN ({order_id_sql})",
+                )
+        async with conn.transaction():
+            await conn.execute(
+                f"DELETE FROM ledger_entries WHERE market_id IN ({market_id_sql})",
+            )
+            await conn.execute(
+                f"DELETE FROM match_work_queue WHERE market_id IN ({market_id_sql})",
+            )
+            await conn.execute(
+                f"DELETE FROM markets WHERE market_id IN ({market_id_sql})",
+            )
 
 
 async def _cleanup(pool: asyncpg.Pool, market_ids: list[str], account_ids: list[str]) -> None:
     async with pool.acquire() as conn:
         if market_ids:
             for batch in _chunks(market_ids, 4):
-                async with conn.transaction():
-                    await _delete_orders_for_markets(conn, batch)
+                await _delete_orders_for_markets(conn, batch)
         if account_ids:
             for batch in _chunks(account_ids, 25):
                 account_id_sql = _uuid_csv(batch)
                 async with conn.transaction():
                     await conn.execute(
                         f"DELETE FROM account_auth_sessions WHERE account_id IN ({account_id_sql})",
+                    )
+                    await conn.execute(
+                        f"DELETE FROM account_cash_buckets WHERE account_id IN ({account_id_sql})",
                     )
                     await conn.execute(
                         f"DELETE FROM accounts WHERE account_id IN ({account_id_sql})",

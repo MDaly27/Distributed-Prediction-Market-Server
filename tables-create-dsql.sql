@@ -129,6 +129,28 @@ CREATE INDEX ASYNC IF NOT EXISTS positions_market_idx ON positions(market_id);
 
 
 -- =========================================================
+-- 4a. Account cash buckets
+-- Sharded cash holders to break the per-account OCC hotspot.
+-- The bucket count must agree across listener / matcher / executor.
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS account_cash_buckets (
+    account_id UUID NOT NULL,
+    bucket_id INT NOT NULL CHECK (bucket_id >= 0),
+
+    available_cash_cents BIGINT NOT NULL DEFAULT 0 CHECK (available_cash_cents >= 0),
+    locked_cash_cents BIGINT NOT NULL DEFAULT 0 CHECK (locked_cash_cents >= 0),
+
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (account_id, bucket_id)
+);
+
+CREATE INDEX ASYNC IF NOT EXISTS account_cash_buckets_account_idx
+    ON account_cash_buckets(account_id);
+
+
+-- =========================================================
 -- 5. Orders
 -- Limit orders only for v1
 -- YES / NO side for prediction markets
@@ -164,9 +186,15 @@ CREATE TABLE IF NOT EXISTS orders (
 
     reject_reason TEXT,
 
+    -- Which account_cash_buckets row holds the locked cash for this order.
+    -- NULL on legacy rows that pre-date the bucketed cash design.
+    lock_bucket_id INT,
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS lock_bucket_id INT;
 
 CREATE UNIQUE INDEX ASYNC IF NOT EXISTS orders_global_seq_uq ON orders(global_seq);
 CREATE INDEX ASYNC IF NOT EXISTS orders_market_seq_idx ON orders(market_id, global_seq);
@@ -366,6 +394,21 @@ CREATE TABLE IF NOT EXISTS matchmaker_market_leases (
 
 CREATE INDEX ASYNC IF NOT EXISTS matchmaker_market_leases_exp_idx
     ON matchmaker_market_leases(lease_expires_at);
+
+-- =========================================================
+-- 12a. Match work queue
+-- Submit-time signal that a market may have a fresh cross.
+-- Replaces the matchmaker's full JOIN+GROUP BY scan over `orders`
+-- with O(markets-just-touched) work per poll.
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS match_work_queue (
+    market_id UUID PRIMARY KEY,
+    queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ASYNC IF NOT EXISTS match_work_queue_queued_idx
+    ON match_work_queue(queued_at);
 
 -- =========================================================
 -- 13. Settlement runs

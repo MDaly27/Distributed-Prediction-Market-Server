@@ -248,6 +248,7 @@ async def _run(args: argparse.Namespace) -> None:
                 account_csv = ", ".join(f"'{account_id}'::uuid" for account_id in account_ids)
                 await conn.execute(f"DELETE FROM account_auth_sessions WHERE account_id IN ({account_csv})")
                 await conn.execute(f"DELETE FROM ledger_entries WHERE account_id IN ({account_csv})")
+                await conn.execute(f"DELETE FROM account_cash_buckets WHERE account_id IN ({account_csv})")
                 await conn.execute(f"DELETE FROM accounts WHERE account_id IN ({account_csv})")
             await conn.execute("DELETE FROM orders WHERE market_id = $1", market_id)
             await conn.execute("DELETE FROM markets WHERE market_id = $1", market_id)

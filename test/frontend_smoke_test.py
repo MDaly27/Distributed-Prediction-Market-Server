@@ -112,6 +112,7 @@ async def _cleanup(conn: asyncpg.Connection, market_ids: list[str], account_ids:
         await conn.execute(f"DELETE FROM ledger_entries WHERE account_id IN ({a_ids})")
         await conn.execute(f"DELETE FROM cash_transactions WHERE account_id IN ({a_ids})")
         await conn.execute(f"DELETE FROM account_auth_sessions WHERE account_id IN ({a_ids})")
+        await conn.execute(f"DELETE FROM account_cash_buckets WHERE account_id IN ({a_ids})")
         await conn.execute(f"DELETE FROM accounts WHERE account_id IN ({a_ids})")
 
 
