@@ -217,23 +217,36 @@ async def _delete_orders_for_markets(conn: asyncpg.Connection, market_ids: list[
         return
     for batch in _chunks(market_ids, 4):
         market_id_sql = _uuid_csv(batch)
-        await conn.execute(
-            f"DELETE FROM ledger_entries WHERE market_id IN ({market_id_sql})",
+        order_rows = await conn.fetch(
+            f"SELECT request_id FROM orders WHERE market_id IN ({market_id_sql})",
         )
-        await conn.execute(
-            f"DELETE FROM orders WHERE market_id IN ({market_id_sql})",
-        )
-        await conn.execute(
-            f"DELETE FROM markets WHERE market_id IN ({market_id_sql})",
-        )
+        order_ids = [str(row["request_id"]) for row in order_rows]
+        for order_batch in _chunks(order_ids, 100):
+            order_id_sql = _uuid_csv(order_batch)
+            async with conn.transaction():
+                await conn.execute(
+                    f"DELETE FROM ledger_entries WHERE order_id IN ({order_id_sql})",
+                )
+                await conn.execute(
+                    f"DELETE FROM orders WHERE request_id IN ({order_id_sql})",
+                )
+        async with conn.transaction():
+            await conn.execute(
+                f"DELETE FROM ledger_entries WHERE market_id IN ({market_id_sql})",
+            )
+            await conn.execute(
+                f"DELETE FROM match_work_queue WHERE market_id IN ({market_id_sql})",
+            )
+            await conn.execute(
+                f"DELETE FROM markets WHERE market_id IN ({market_id_sql})",
+            )
 
 
 async def _cleanup(pool: asyncpg.Pool, market_ids: list[str], account_ids: list[str]) -> None:
     async with pool.acquire() as conn:
         if market_ids:
             for batch in _chunks(market_ids, 4):
-                async with conn.transaction():
-                    await _delete_orders_for_markets(conn, batch)
+                await _delete_orders_for_markets(conn, batch)
         if account_ids:
             for batch in _chunks(account_ids, 25):
                 account_id_sql = _uuid_csv(batch)
