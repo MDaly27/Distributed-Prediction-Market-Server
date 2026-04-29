@@ -495,9 +495,11 @@ class OrderRepository:
             if not isinstance(status_filter, Sequence) or isinstance(status_filter, (str, bytes)):
                 raise SubmissionError("statuses must be an array of strings")
             statuses = [str(s).upper() for s in status_filter]
-            clauses.append(f"status = ANY(${idx}::text[])")
-            args.append(statuses)
-            idx += 1
+            if statuses:
+                placeholders = ",".join(f"${idx + i}" for i in range(len(statuses)))
+                clauses.append(f"status IN ({placeholders})")
+                args.extend(statuses)
+                idx += len(statuses)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         args.append(limit)
@@ -1060,9 +1062,11 @@ class OrderRepository:
             if not isinstance(statuses_payload, Sequence) or isinstance(statuses_payload, (str, bytes)):
                 raise SubmissionError("statuses must be an array of strings")
             statuses = [str(s).upper() for s in statuses_payload]
-            clauses.append(f"m.status = ANY(${idx}::text[])")
-            args.append(statuses)
-            idx += 1
+            if statuses:
+                placeholders = ",".join(f"${idx + i}" for i in range(len(statuses)))
+                clauses.append(f"m.status IN ({placeholders})")
+                args.extend(statuses)
+                idx += len(statuses)
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         args.append(limit)
 

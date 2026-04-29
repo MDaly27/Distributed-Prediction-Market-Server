@@ -144,13 +144,16 @@ class MatchRepository:
             if not mine:
                 METRICS.set_gauge("matchmaker_queue_depth_sample", float(len(rows)))
                 return []
+            # IN-list with positional placeholders avoids asyncpg's array
+            # type introspection, which DSQL rejects (it tries SET jit=off).
+            placeholders = ",".join(f"${i + 1}::uuid" for i in range(len(mine)))
             deleted = await conn.fetch(
-                """
+                f"""
                 DELETE FROM match_work_queue
-                WHERE market_id = ANY($1::uuid[])
+                WHERE market_id IN ({placeholders})
                 RETURNING market_id, queued_at
                 """,
-                mine,
+                *mine,
             )
             METRICS.incr("matchmaker_claimed_markets_total", float(len(deleted)))
             METRICS.set_gauge("matchmaker_queue_depth_sample", float(len(rows)))
