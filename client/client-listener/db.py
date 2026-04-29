@@ -85,6 +85,9 @@ def _wallet_cash_effect(entry: Any) -> int:
     return cash_delta
 
 
+_MARKET_CACHE_MISS = object()
+
+
 class MarketCache:
     def __init__(self, pool: asyncpg.Pool, ttl_seconds: float = 5.0) -> None:
         self.pool = pool
@@ -92,26 +95,24 @@ class MarketCache:
         self._entries: dict[str, tuple[float, dict[str, Any] | None]] = {}
         self._lock = asyncio.Lock()
 
-    def _lookup(self, market_id: str) -> dict[str, Any] | None | object:
-        sentinel: object = object()
-        entry = self._entries.get(market_id, sentinel)
-        if entry is sentinel:
-            return sentinel
-        ts, data = entry  # type: ignore[misc]
+    def _lookup(self, market_id: str) -> Any:
+        entry = self._entries.get(market_id)
+        if entry is None:
+            return _MARKET_CACHE_MISS
+        ts, data = entry
         if (time.monotonic() - ts) > self.ttl_seconds:
-            return sentinel
+            return _MARKET_CACHE_MISS
         return data
 
     def invalidate(self, market_id: str) -> None:
         self._entries.pop(market_id, None)
 
     async def validate(self, market_id: str, price_cents: int) -> None:
-        sentinel: object = object()
         cached = self._lookup(market_id)
-        if cached is sentinel:
+        if cached is _MARKET_CACHE_MISS:
             async with self._lock:
                 cached = self._lookup(market_id)
-                if cached is sentinel:
+                if cached is _MARKET_CACHE_MISS:
                     async with self.pool.acquire() as conn:
                         row = await conn.fetchrow(
                             """
@@ -133,10 +134,9 @@ class MarketCache:
                     self._entries[market_id] = (time.monotonic(), cached)
         if cached is None:
             raise SubmissionError("market not found")
-        data: dict[str, Any] = cached  # type: ignore[assignment]
-        if data["status"] != "ACTIVE":
-            raise SubmissionError(f"market status is {data['status']}, not ACTIVE")
-        if price_cents < data["min_price_cents"] or price_cents > data["max_price_cents"]:
+        if cached["status"] != "ACTIVE":
+            raise SubmissionError(f"market status is {cached['status']}, not ACTIVE")
+        if price_cents < cached["min_price_cents"] or price_cents > cached["max_price_cents"]:
             raise SubmissionError("price outside market bounds")
 
 
