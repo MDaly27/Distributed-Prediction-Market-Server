@@ -1,5 +1,6 @@
 import asyncio
 import random
+import time
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,7 @@ from typing import Any
 
 import asyncpg
 
+from metrics import METRICS, Timer
 from models import CancelOrderRequest, SubmitOrderRequest
 from security import generate_session_token, hash_password, hash_session_token, verify_password
 
@@ -20,6 +22,23 @@ class RetryableOCCError(Exception):
 
 
 OPEN_ORDER_STATUSES = ("ACCEPTED", "OPEN", "PARTIALLY_FILLED")
+
+# Must agree with the matcher and executor processes.
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _bucket_for_uuid(value: str) -> int:
+    try:
+        return int(uuid.UUID(value).int) % ACCOUNT_CASH_BUCKETS
+    except Exception:
+        return abs(hash(value)) % ACCOUNT_CASH_BUCKETS
+
+
+def _split_amount(amount_cents: int, n_buckets: int) -> list[int]:
+    base, rem = divmod(amount_cents, n_buckets)
+    out = [base] * n_buckets
+    out[0] += rem
+    return out
 
 
 def _is_occ_error(exc: Exception) -> bool:
@@ -66,10 +85,97 @@ def _wallet_cash_effect(entry: Any) -> int:
     return cash_delta
 
 
+class MarketCache:
+    def __init__(self, pool: asyncpg.Pool, ttl_seconds: float = 5.0) -> None:
+        self.pool = pool
+        self.ttl_seconds = ttl_seconds
+        self._entries: dict[str, tuple[float, dict[str, Any] | None]] = {}
+        self._lock = asyncio.Lock()
+
+    def _lookup(self, market_id: str) -> dict[str, Any] | None | object:
+        sentinel: object = object()
+        entry = self._entries.get(market_id, sentinel)
+        if entry is sentinel:
+            return sentinel
+        ts, data = entry  # type: ignore[misc]
+        if (time.monotonic() - ts) > self.ttl_seconds:
+            return sentinel
+        return data
+
+    def invalidate(self, market_id: str) -> None:
+        self._entries.pop(market_id, None)
+
+    async def validate(self, market_id: str, price_cents: int) -> None:
+        sentinel: object = object()
+        cached = self._lookup(market_id)
+        if cached is sentinel:
+            async with self._lock:
+                cached = self._lookup(market_id)
+                if cached is sentinel:
+                    async with self.pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            """
+                            SELECT status, min_price_cents, max_price_cents
+                            FROM markets
+                            WHERE market_id = $1
+                            """,
+                            market_id,
+                        )
+                    cached = (
+                        None
+                        if row is None
+                        else {
+                            "status": str(row["status"]),
+                            "min_price_cents": int(row["min_price_cents"]),
+                            "max_price_cents": int(row["max_price_cents"]),
+                        }
+                    )
+                    self._entries[market_id] = (time.monotonic(), cached)
+        if cached is None:
+            raise SubmissionError("market not found")
+        data: dict[str, Any] = cached  # type: ignore[assignment]
+        if data["status"] != "ACTIVE":
+            raise SubmissionError(f"market status is {data['status']}, not ACTIVE")
+        if price_cents < data["min_price_cents"] or price_cents > data["max_price_cents"]:
+            raise SubmissionError("price outside market bounds")
+
+
+class SessionCache:
+    def __init__(self, ttl_seconds: float = 5.0, max_entries: int = 50_000) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._entries: dict[tuple[str, str], float] = {}
+
+    def is_valid(self, account_id: str, token_hash: str) -> bool:
+        key = (account_id, token_hash)
+        ts = self._entries.get(key)
+        if ts is None:
+            return False
+        if (time.monotonic() - ts) > self.ttl_seconds:
+            self._entries.pop(key, None)
+            return False
+        return True
+
+    def remember(self, account_id: str, token_hash: str) -> None:
+        if len(self._entries) >= self.max_entries:
+            cutoff = sorted(self._entries.values())[len(self._entries) // 20]
+            self._entries = {k: v for k, v in self._entries.items() if v >= cutoff}
+        self._entries[(account_id, token_hash)] = time.monotonic()
+
+    def forget(self, account_id: str, token_hash: str | None = None) -> None:
+        if token_hash is None:
+            for key in [k for k in self._entries if k[0] == account_id]:
+                self._entries.pop(key, None)
+        else:
+            self._entries.pop((account_id, token_hash), None)
+
+
 class OrderRepository:
     def __init__(self, pool: asyncpg.Pool, account_session_ttl_seconds: int = 43200):
         self.pool = pool
         self.account_session_ttl_seconds = account_session_ttl_seconds
+        self.market_cache = MarketCache(pool)
+        self.session_cache = SessionCache()
 
     async def _with_occ_retry(self, fn):
         max_attempts = 5
@@ -77,11 +183,13 @@ class OrderRepository:
             try:
                 return await fn()
             except RetryableOCCError:
+                METRICS.incr("listener_occ_retries_total")
                 if attempt == max_attempts:
                     raise SubmissionError("database conflict after retries")
             except asyncpg.PostgresError as exc:
                 if not _is_occ_error(exc):
                     raise SubmissionError(f"database error: {exc}") from exc
+                METRICS.incr("listener_occ_retries_total")
                 if attempt == max_attempts:
                     raise SubmissionError("database conflict after retries") from exc
             delay = (0.02 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.02)
@@ -111,32 +219,36 @@ class OrderRepository:
         account_id = str(uuid.uuid4())
         password_hash, password_salt, password_iterations = hash_password(password)
 
+        initial_cash_cents = 5000
         try:
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO accounts (
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO accounts (
+                            account_id,
+                            external_user_id,
+                            username,
+                            status,
+                            available_cash_cents,
+                            locked_cash_cents,
+                            password_hash,
+                            password_salt,
+                            password_iterations,
+                            is_admin
+                        )
+                        VALUES ($1, $2, $3, 'ACTIVE', $7, 0, $4, $5, $6, FALSE)
+                        RETURNING account_id, username, external_user_id, status, available_cash_cents, is_admin
+                        """,
                         account_id,
                         external_user_id,
                         username,
-                        status,
-                        available_cash_cents,
-                        locked_cash_cents,
                         password_hash,
                         password_salt,
                         password_iterations,
-                        is_admin
+                        initial_cash_cents,
                     )
-                    VALUES ($1, $2, $3, 'ACTIVE', 5000, 0, $4, $5, $6, FALSE)
-                    RETURNING account_id, username, external_user_id, status, available_cash_cents, is_admin
-                    """,
-                    account_id,
-                    external_user_id,
-                    username,
-                    password_hash,
-                    password_salt,
-                    password_iterations,
-                )
+                    await self._seed_account_cash_buckets(conn, account_id, initial_cash_cents)
         except asyncpg.PostgresError as exc:
             if exc.sqlstate == "23505":
                 raise SubmissionError("username or external_user_id already exists") from exc
@@ -148,9 +260,32 @@ class OrderRepository:
             "external_user_id": row["external_user_id"],
             "status": str(row["status"]),
             "available_cash_cents": int(row["available_cash_cents"]),
-            "bonus_cents": 5000,
+            "bonus_cents": initial_cash_cents,
             "is_admin": bool(row["is_admin"]),
         }
+
+    async def _seed_account_cash_buckets(
+        self,
+        conn: asyncpg.Connection,
+        account_id: str,
+        available_cash_cents: int,
+        locked_cash_cents: int = 0,
+    ) -> None:
+        avail_split = _split_amount(available_cash_cents, ACCOUNT_CASH_BUCKETS)
+        locked_split = _split_amount(locked_cash_cents, ACCOUNT_CASH_BUCKETS)
+        await conn.executemany(
+            """
+            INSERT INTO account_cash_buckets (
+                account_id, bucket_id, available_cash_cents, locked_cash_cents
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (account_id, bucket_id) DO NOTHING
+            """,
+            [
+                (account_id, b, avail_split[b], locked_split[b])
+                for b in range(ACCOUNT_CASH_BUCKETS)
+            ],
+        )
 
     async def authenticate_account(self, payload: dict[str, Any]) -> dict[str, Any]:
         username = _require_non_empty_str(payload.get("username"), "username")
@@ -188,6 +323,7 @@ class OrderRepository:
                     """,
                     row["account_id"],
                 )
+                self.session_cache.forget(str(row["account_id"]))
 
                 account_session_token = generate_session_token()
                 expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.account_session_ttl_seconds)
@@ -223,6 +359,9 @@ class OrderRepository:
         account_id: str,
         account_session_token: str,
     ) -> None:
+        token_hash = hash_session_token(account_session_token)
+        if self.session_cache.is_valid(account_id, token_hash):
+            return
         session_row = await conn.fetchrow(
             """
             UPDATE account_auth_sessions
@@ -234,10 +373,11 @@ class OrderRepository:
             RETURNING session_id
             """,
             account_id,
-            hash_session_token(account_session_token),
+            token_hash,
         )
         if not session_row:
             raise SubmissionError("account authentication failed")
+        self.session_cache.remember(account_id, token_hash)
 
     async def _require_admin_account_session(
         self,
@@ -265,10 +405,26 @@ class OrderRepository:
         }
 
     async def submit_order(self, req: SubmitOrderRequest) -> dict[str, Any]:
-        return await self._with_occ_retry(lambda: self._submit_order_once(req))
+        with Timer(METRICS, "listener_submit_latency_ms"):
+            try:
+                result = await self._with_occ_retry(lambda: self._submit_order_once(req))
+            except SubmissionError:
+                METRICS.incr("listener_submit_errors_total")
+                raise
+            METRICS.incr("listener_submit_total")
+            if result.get("idempotent"):
+                METRICS.incr("listener_submit_idempotent_total")
+            return result
 
     async def cancel_order(self, req: CancelOrderRequest) -> dict[str, Any]:
-        return await self._with_occ_retry(lambda: self._cancel_order_once(req))
+        with Timer(METRICS, "listener_cancel_latency_ms"):
+            try:
+                result = await self._with_occ_retry(lambda: self._cancel_order_once(req))
+            except SubmissionError:
+                METRICS.incr("listener_cancel_errors_total")
+                raise
+            METRICS.incr("listener_cancel_total")
+            return result
 
     async def get_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         order_id = _require_uuid(payload.get("order_id"), "order_id")
@@ -614,7 +770,7 @@ class OrderRepository:
         async with self.pool.acquire() as conn:
             account = await conn.fetchrow(
                 """
-                SELECT account_id, username, is_admin, status, available_cash_cents, locked_cash_cents, updated_at
+                SELECT account_id, username, is_admin, status, updated_at
                 FROM accounts
                 WHERE account_id = $1
                 """,
@@ -622,6 +778,17 @@ class OrderRepository:
             )
             if not account:
                 raise SubmissionError("account not found")
+
+            bucket_totals = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM(available_cash_cents), 0) AS available,
+                    COALESCE(SUM(locked_cash_cents),    0) AS locked
+                FROM account_cash_buckets
+                WHERE account_id = $1
+                """,
+                account_id,
+            )
 
             dep_sum = await conn.fetchval(
                 """
@@ -645,8 +812,8 @@ class OrderRepository:
             "username": str(account["username"]),
             "is_admin": bool(account["is_admin"]),
             "status": str(account["status"]),
-            "available_cash_cents": int(account["available_cash_cents"]),
-            "locked_cash_cents": int(account["locked_cash_cents"]),
+            "available_cash_cents": int(bucket_totals["available"]),
+            "locked_cash_cents": int(bucket_totals["locked"]),
             "total_deposits_cents": int(dep_sum),
             "total_withdrawals_cents": int(wd_sum),
             "updated_at": account["updated_at"].isoformat(),
@@ -659,7 +826,7 @@ class OrderRepository:
         async with self.pool.acquire() as conn:
             account = await conn.fetchrow(
                 """
-                SELECT account_id, username, available_cash_cents, locked_cash_cents
+                SELECT account_id, username
                 FROM accounts
                 WHERE account_id = $1
                 """,
@@ -667,6 +834,17 @@ class OrderRepository:
             )
             if not account:
                 raise SubmissionError("account not found")
+
+            bucket_totals = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM(available_cash_cents), 0) AS available,
+                    COALESCE(SUM(locked_cash_cents),    0) AS locked
+                FROM account_cash_buckets
+                WHERE account_id = $1
+                """,
+                account_id,
+            )
 
             rows = await conn.fetch(
                 """
@@ -684,7 +862,7 @@ class OrderRepository:
                 limit,
             )
 
-        current_total_cash = int(account["available_cash_cents"]) + int(account["locked_cash_cents"])
+        current_total_cash = int(bucket_totals["available"]) + int(bucket_totals["locked"])
         baseline_cash = current_total_cash - sum(_wallet_cash_effect(row) for row in rows)
         running_cash = baseline_cash
         points: list[dict[str, Any]] = []
@@ -716,7 +894,7 @@ class OrderRepository:
             "account_id": str(account["account_id"]),
             "username": str(account["username"]),
             "current_total_cash_cents": current_total_cash,
-            "current_locked_cash_cents": int(account["locked_cash_cents"]),
+            "current_locked_cash_cents": int(bucket_totals["locked"]),
             "baseline_total_cash_cents": baseline_cash,
             "points": points,
         }
@@ -762,36 +940,67 @@ class OrderRepository:
                         "status": str(existing["status"]),
                     }
 
+                account = await conn.fetchrow(
+                    "SELECT status FROM accounts WHERE account_id = $1",
+                    account_id,
+                )
+                if not account or str(account["status"]) != "ACTIVE":
+                    raise SubmissionError("account update failed (inactive or insufficient funds)")
+
+                await self._seed_account_cash_buckets(conn, account_id, 0, 0)
+
                 if tx_type == "DEPOSIT":
-                    account_update = await conn.execute(
+                    deposit_split = _split_amount(amount, ACCOUNT_CASH_BUCKETS)
+                    await conn.executemany(
                         """
-                        UPDATE accounts
-                        SET available_cash_cents = available_cash_cents + $2,
+                        UPDATE account_cash_buckets
+                        SET available_cash_cents = available_cash_cents + $3,
                             updated_at = now()
-                        WHERE account_id = $1
-                          AND status = 'ACTIVE'
+                        WHERE account_id = $1 AND bucket_id = $2
                         """,
-                        account_id,
-                        amount,
+                        [(account_id, b, deposit_split[b]) for b in range(ACCOUNT_CASH_BUCKETS)],
                     )
                     cash_delta = amount
                 else:
-                    account_update = await conn.execute(
+                    bucket_balances = await conn.fetch(
                         """
-                        UPDATE accounts
-                        SET available_cash_cents = available_cash_cents - $2,
-                            updated_at = now()
+                        SELECT bucket_id, available_cash_cents
+                        FROM account_cash_buckets
                         WHERE account_id = $1
-                          AND status = 'ACTIVE'
-                          AND available_cash_cents >= $2
+                        ORDER BY available_cash_cents DESC, bucket_id ASC
                         """,
                         account_id,
-                        amount,
                     )
+                    total_avail = sum(int(r["available_cash_cents"]) for r in bucket_balances)
+                    if total_avail < amount:
+                        raise SubmissionError("account update failed (inactive or insufficient funds)")
+                    remaining = amount
+                    for r in bucket_balances:
+                        if remaining <= 0:
+                            break
+                        avail = int(r["available_cash_cents"])
+                        take = avail if avail < remaining else remaining
+                        if take <= 0:
+                            continue
+                        result = await conn.execute(
+                            """
+                            UPDATE account_cash_buckets
+                            SET available_cash_cents = available_cash_cents - $3,
+                                updated_at = now()
+                            WHERE account_id = $1
+                              AND bucket_id  = $2
+                              AND available_cash_cents >= $3
+                            """,
+                            account_id,
+                            int(r["bucket_id"]),
+                            take,
+                        )
+                        if result != "UPDATE 1":
+                            raise RetryableOCCError("bucket changed concurrently during withdraw")
+                        remaining -= take
+                    if remaining > 0:
+                        raise RetryableOCCError("withdraw could not be satisfied across buckets")
                     cash_delta = -amount
-
-                if account_update != "UPDATE 1":
-                    raise SubmissionError("account update failed (inactive or insufficient funds)")
 
                 await conn.execute(
                     """
@@ -1085,6 +1294,7 @@ class OrderRepository:
                     resolve_time,
                     created_by,
                 )
+                self.market_cache.invalidate(market_id)
                 return {
                     "idempotent": False,
                     "market_id": str(row["market_id"]),
@@ -1139,6 +1349,7 @@ class OrderRepository:
                 if updated != "UPDATE 1":
                     raise RetryableOCCError("market changed concurrently")
 
+                self.market_cache.invalidate(market_id)
                 return {
                     "idempotent": False,
                     "market_id": market_id,
@@ -1198,6 +1409,7 @@ class OrderRepository:
                     market_id,
                     market_status,
                 )
+                self.market_cache.invalidate(market_id)
                 return {
                     "idempotent": False,
                     "resolution_id": resolution_id,
@@ -1260,67 +1472,149 @@ class OrderRepository:
 
     async def _submit_order_tx(self, conn: asyncpg.Connection, req: SubmitOrderRequest) -> dict[str, Any]:
         needed_cash = req.qty * req.price_cents
+        await self.market_cache.validate(req.market_id, req.price_cents)
+
+        token_hash = hash_session_token(req.account_session_token)
+        session_pre_validated = self.session_cache.is_valid(req.account_id, token_hash)
+
+        entry_id = str(uuid.uuid4())
+        notes = f"TCP order lock for {req.request_id}"
+        bucket_id = _bucket_for_uuid(req.request_id)
+
         try:
-            existing = await conn.fetchrow(
-                """
-                SELECT request_id, global_seq, status, remaining_qty
-                FROM orders
-                WHERE request_id = $1
-                """,
-                req.request_id,
-            )
-            if existing:
-                return {
-                    "idempotent": True,
-                    "request_id": str(existing["request_id"]),
-                    "global_seq": int(existing["global_seq"]),
-                    "status": str(existing["status"]),
-                    "remaining_qty": int(existing["remaining_qty"]),
-                }
-
-            await self._require_account_session(conn, req.account_id, req.account_session_token)
-
-            market = await conn.fetchrow(
-                """
-                SELECT market_id, status, min_price_cents, max_price_cents
-                FROM markets
-                WHERE market_id = $1
-                """,
-                req.market_id,
-            )
-            if not market:
-                raise SubmissionError("market not found")
-            if market["status"] != "ACTIVE":
-                raise SubmissionError(f"market status is {market['status']}, not ACTIVE")
-            if req.price_cents < market["min_price_cents"] or req.price_cents > market["max_price_cents"]:
-                raise SubmissionError("price outside market bounds")
-
-            account_update = await conn.execute(
-                """
-                UPDATE accounts
-                SET
-                    available_cash_cents = available_cash_cents - $2,
-                    locked_cash_cents = locked_cash_cents + $2,
-                    updated_at = now()
-                WHERE account_id = $1
-                  AND status = 'ACTIVE'
-                  AND available_cash_cents >= $2
-                """,
-                req.account_id,
-                needed_cash,
-            )
-            if account_update != "UPDATE 1":
-                raise SubmissionError("insufficient funds or inactive account")
-
-            order_row = await conn.fetchrow(
-                """
-                INSERT INTO orders (
-                    request_id, account_id, market_id, side, order_type, time_in_force,
-                    qty, remaining_qty, price_cents, ingress_ts_ns, status
+            if session_pre_validated:
+                row = await self._submit_order_cte(
+                    conn,
+                    req=req,
+                    needed_cash=needed_cash,
+                    bucket_id=bucket_id,
+                    entry_id=entry_id,
+                    notes=notes,
+                    token_hash=None,
                 )
-                VALUES ($1, $2, $3, $4, 'LIMIT', $5, $6, $6, $7, $8, 'ACCEPTED')
-                RETURNING request_id, global_seq, status, remaining_qty
-                """,
+            else:
+                row = await self._submit_order_cte(
+                    conn,
+                    req=req,
+                    needed_cash=needed_cash,
+                    bucket_id=bucket_id,
+                    entry_id=entry_id,
+                    notes=notes,
+                    token_hash=token_hash,
+                )
+        except asyncpg.PostgresError as exc:
+            if _is_occ_error(exc):
+                raise RetryableOCCError from exc
+            raise SubmissionError(f"database error: {exc}") from exc
+
+        if row is None:
+            raise SubmissionError("submit_order returned no result row")
+
+        idempotent = bool(row["idempotent"])
+        session_ok = bool(row["session_ok"])
+        funds_ok = bool(row["funds_ok"])
+
+        if not idempotent and not session_ok:
+            raise SubmissionError("account authentication failed")
+
+        if not idempotent and not funds_ok:
+            # Picked bucket may be empty even though sum-of-buckets covers it.
+            row = await self._submit_order_cte_fallback(
+                conn,
+                req=req,
+                needed_cash=needed_cash,
+                entry_id=entry_id,
+                notes=notes,
+            )
+            if row is None or not bool(row["funds_ok"]):
+                raise SubmissionError("insufficient funds or inactive account")
+            idempotent = False
+
+        if not session_pre_validated and session_ok:
+            self.session_cache.remember(req.account_id, token_hash)
+
+        return {
+            "idempotent": idempotent,
+            "request_id": str(row["request_id"]),
+            "global_seq": int(row["global_seq"]),
+            "status": str(row["status"]),
+            "remaining_qty": int(row["remaining_qty"]),
+        }
+
+    async def _submit_order_cte(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        req: SubmitOrderRequest,
+        needed_cash: int,
+        bucket_id: int,
+        entry_id: str,
+        notes: str,
+        token_hash: str | None,
+    ) -> Any:
+        if token_hash is None:
+            sql = """
+                WITH
+                  existing AS (
+                    SELECT request_id, global_seq, status, remaining_qty
+                    FROM orders
+                    WHERE request_id = $1
+                  ),
+                  acct_bkt AS (
+                    UPDATE account_cash_buckets
+                    SET available_cash_cents = available_cash_cents - $9,
+                        locked_cash_cents    = locked_cash_cents    + $9,
+                        updated_at = now()
+                    WHERE account_id = $2
+                      AND bucket_id  = $12
+                      AND available_cash_cents >= $9
+                      AND NOT EXISTS (SELECT 1 FROM existing)
+                    RETURNING bucket_id
+                  ),
+                  ord AS (
+                    INSERT INTO orders (
+                        request_id, account_id, market_id, side, order_type,
+                        time_in_force, qty, remaining_qty, price_cents,
+                        ingress_ts_ns, status, lock_bucket_id
+                    )
+                    SELECT $1, $2, $3, $4, 'LIMIT', $5, $6, $6, $7, $8, 'ACCEPTED', bucket_id
+                    FROM acct_bkt
+                    RETURNING request_id, global_seq, status, remaining_qty
+                  ),
+                  led AS (
+                    INSERT INTO ledger_entries (
+                        entry_id, account_id, market_id, order_id,
+                        cash_delta_cents, locked_cash_delta_cents,
+                        yes_share_delta, no_share_delta, locked_yes_delta, locked_no_delta,
+                        reason, notes
+                    )
+                    SELECT $10, $2, $3, $1, 0, $9, 0, 0, 0, 0, 'ORDER_LOCK', $11
+                    FROM ord
+                    RETURNING entry_id
+                  ),
+                  q AS (
+                    INSERT INTO match_work_queue (market_id, queued_at)
+                    SELECT $3, now()
+                    FROM ord
+                    ON CONFLICT (market_id) DO NOTHING
+                    RETURNING market_id
+                  )
+                SELECT
+                  EXISTS(SELECT 1 FROM existing) AS idempotent,
+                  TRUE                           AS session_ok,
+                  EXISTS(SELECT 1 FROM acct_bkt) AS funds_ok,
+                  EXISTS(SELECT 1 FROM led)      AS ledger_inserted,
+                  COALESCE((SELECT request_id::text FROM existing),
+                           (SELECT request_id::text FROM ord))    AS request_id,
+                  COALESCE((SELECT global_seq      FROM existing),
+                           (SELECT global_seq      FROM ord))     AS global_seq,
+                  COALESCE((SELECT status          FROM existing),
+                           (SELECT status          FROM ord))     AS status,
+                  COALESCE((SELECT remaining_qty   FROM existing),
+                           (SELECT remaining_qty   FROM ord))     AS remaining_qty
+            """
+            return await conn.fetchrow(
+                sql,
                 req.request_id,
                 req.account_id,
                 req.market_id,
@@ -1329,37 +1623,190 @@ class OrderRepository:
                 req.qty,
                 req.price_cents,
                 req.ingress_ts_ns,
+                needed_cash,
+                entry_id,
+                notes,
+                bucket_id,
             )
 
-            await conn.execute(
-                """
+        sql = """
+            WITH
+              existing AS (
+                SELECT request_id, global_seq, status, remaining_qty
+                FROM orders
+                WHERE request_id = $1
+              ),
+              session_check AS (
+                UPDATE account_auth_sessions
+                SET last_used_at = now()
+                WHERE account_id = $2
+                  AND token_hash = $13
+                  AND revoked_at IS NULL
+                  AND expires_at > now()
+                RETURNING session_id
+              ),
+              acct_bkt AS (
+                UPDATE account_cash_buckets
+                SET available_cash_cents = available_cash_cents - $9,
+                    locked_cash_cents    = locked_cash_cents    + $9,
+                    updated_at = now()
+                WHERE account_id = $2
+                  AND bucket_id  = $12
+                  AND available_cash_cents >= $9
+                  AND NOT EXISTS (SELECT 1 FROM existing)
+                  AND EXISTS (SELECT 1 FROM session_check)
+                RETURNING bucket_id
+              ),
+              ord AS (
+                INSERT INTO orders (
+                    request_id, account_id, market_id, side, order_type,
+                    time_in_force, qty, remaining_qty, price_cents,
+                    ingress_ts_ns, status, lock_bucket_id
+                )
+                SELECT $1, $2, $3, $4, 'LIMIT', $5, $6, $6, $7, $8, 'ACCEPTED', bucket_id
+                FROM acct_bkt
+                RETURNING request_id, global_seq, status, remaining_qty
+              ),
+              led AS (
                 INSERT INTO ledger_entries (
                     entry_id, account_id, market_id, order_id,
                     cash_delta_cents, locked_cash_delta_cents,
                     yes_share_delta, no_share_delta, locked_yes_delta, locked_no_delta,
                     reason, notes
                 )
-                VALUES ($1, $2, $3, $4, 0, $5, 0, 0, 0, 0, 'ORDER_LOCK', $6)
-                """,
-                str(uuid.uuid4()),
-                req.account_id,
-                req.market_id,
-                req.request_id,
-                needed_cash,
-                f"TCP order lock for {req.request_id}",
-            )
+                SELECT $10, $2, $3, $1, 0, $9, 0, 0, 0, 0, 'ORDER_LOCK', $11
+                FROM ord
+                RETURNING entry_id
+              ),
+              q AS (
+                INSERT INTO match_work_queue (market_id, queued_at)
+                SELECT $3, now()
+                FROM ord
+                ON CONFLICT (market_id) DO NOTHING
+                RETURNING market_id
+              )
+            SELECT
+              EXISTS(SELECT 1 FROM existing)      AS idempotent,
+              EXISTS(SELECT 1 FROM session_check) AS session_ok,
+              EXISTS(SELECT 1 FROM acct_bkt)      AS funds_ok,
+              EXISTS(SELECT 1 FROM led)           AS ledger_inserted,
+              COALESCE((SELECT request_id::text FROM existing),
+                       (SELECT request_id::text FROM ord))    AS request_id,
+              COALESCE((SELECT global_seq      FROM existing),
+                       (SELECT global_seq      FROM ord))     AS global_seq,
+              COALESCE((SELECT status          FROM existing),
+                       (SELECT status          FROM ord))     AS status,
+              COALESCE((SELECT remaining_qty   FROM existing),
+                       (SELECT remaining_qty   FROM ord))     AS remaining_qty
+        """
+        return await conn.fetchrow(
+            sql,
+            req.request_id,
+            req.account_id,
+            req.market_id,
+            req.side,
+            req.time_in_force,
+            req.qty,
+            req.price_cents,
+            req.ingress_ts_ns,
+            needed_cash,
+            entry_id,
+            notes,
+            bucket_id,
+            token_hash,
+        )
 
-            return {
-                "idempotent": False,
-                "request_id": str(order_row["request_id"]),
-                "global_seq": int(order_row["global_seq"]),
-                "status": str(order_row["status"]),
-                "remaining_qty": int(order_row["remaining_qty"]),
-            }
-        except asyncpg.PostgresError as exc:
-            if _is_occ_error(exc):
-                raise RetryableOCCError from exc
-            raise SubmissionError(f"database error: {exc}") from exc
+    async def _submit_order_cte_fallback(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        req: SubmitOrderRequest,
+        needed_cash: int,
+        entry_id: str,
+        notes: str,
+    ) -> Any:
+        sql = """
+            WITH
+              existing AS (
+                SELECT request_id, global_seq, status, remaining_qty
+                FROM orders
+                WHERE request_id = $1
+              ),
+              chosen AS (
+                SELECT bucket_id
+                FROM account_cash_buckets
+                WHERE account_id = $2
+                  AND available_cash_cents >= $9
+                ORDER BY available_cash_cents DESC, bucket_id ASC
+                LIMIT 1
+              ),
+              acct_bkt AS (
+                UPDATE account_cash_buckets
+                SET available_cash_cents = available_cash_cents - $9,
+                    locked_cash_cents    = locked_cash_cents    + $9,
+                    updated_at = now()
+                WHERE account_id = $2
+                  AND bucket_id  = (SELECT bucket_id FROM chosen)
+                  AND available_cash_cents >= $9
+                  AND NOT EXISTS (SELECT 1 FROM existing)
+                RETURNING bucket_id
+              ),
+              ord AS (
+                INSERT INTO orders (
+                    request_id, account_id, market_id, side, order_type,
+                    time_in_force, qty, remaining_qty, price_cents,
+                    ingress_ts_ns, status, lock_bucket_id
+                )
+                SELECT $1, $2, $3, $4, 'LIMIT', $5, $6, $6, $7, $8, 'ACCEPTED', bucket_id
+                FROM acct_bkt
+                RETURNING request_id, global_seq, status, remaining_qty
+              ),
+              led AS (
+                INSERT INTO ledger_entries (
+                    entry_id, account_id, market_id, order_id,
+                    cash_delta_cents, locked_cash_delta_cents,
+                    yes_share_delta, no_share_delta, locked_yes_delta, locked_no_delta,
+                    reason, notes
+                )
+                SELECT $10, $2, $3, $1, 0, $9, 0, 0, 0, 0, 'ORDER_LOCK', $11
+                FROM ord
+                RETURNING entry_id
+              ),
+              q AS (
+                INSERT INTO match_work_queue (market_id, queued_at)
+                SELECT $3, now()
+                FROM ord
+                ON CONFLICT (market_id) DO NOTHING
+                RETURNING market_id
+              )
+            SELECT
+              EXISTS(SELECT 1 FROM existing) AS idempotent,
+              TRUE                           AS session_ok,
+              EXISTS(SELECT 1 FROM acct_bkt) AS funds_ok,
+              EXISTS(SELECT 1 FROM led)      AS ledger_inserted,
+              COALESCE((SELECT request_id::text FROM existing),
+                       (SELECT request_id::text FROM ord))    AS request_id,
+              COALESCE((SELECT global_seq      FROM existing),
+                       (SELECT global_seq      FROM ord))     AS global_seq,
+              COALESCE((SELECT status          FROM existing),
+                       (SELECT status          FROM ord))     AS status,
+              COALESCE((SELECT remaining_qty   FROM existing),
+                       (SELECT remaining_qty   FROM ord))     AS remaining_qty
+        """
+        return await conn.fetchrow(
+            sql,
+            req.request_id,
+            req.account_id,
+            req.market_id,
+            req.side,
+            req.time_in_force,
+            req.qty,
+            req.price_cents,
+            req.ingress_ts_ns,
+            needed_cash,
+            entry_id,
+            notes,
+        )
 
     async def _cancel_order_once(self, req: CancelOrderRequest) -> dict[str, Any]:
         async with self.pool.acquire() as conn:
@@ -1418,7 +1865,7 @@ class OrderRepository:
 
             order_row = await conn.fetchrow(
                 """
-                SELECT request_id, account_id, market_id, price_cents, remaining_qty, status
+                SELECT request_id, account_id, market_id, price_cents, remaining_qty, status, lock_bucket_id
                 FROM orders
                 WHERE request_id = $1
                 """,
@@ -1434,6 +1881,12 @@ class OrderRepository:
                 raise SubmissionError("order has no remaining quantity to cancel")
 
             unlock_cash = int(order_row["remaining_qty"]) * int(order_row["price_cents"])
+            # Legacy orders may have a NULL lock_bucket_id.
+            lock_bucket_id = order_row["lock_bucket_id"]
+            if lock_bucket_id is None:
+                lock_bucket_id = _bucket_for_uuid(order_id)
+            else:
+                lock_bucket_id = int(lock_bucket_id)
 
             order_update = await conn.execute(
                 """
@@ -1455,20 +1908,21 @@ class OrderRepository:
 
             account_update = await conn.execute(
                 """
-                UPDATE accounts
+                UPDATE account_cash_buckets
                 SET
-                    available_cash_cents = available_cash_cents + $2,
-                    locked_cash_cents = locked_cash_cents - $2,
+                    available_cash_cents = available_cash_cents + $3,
+                    locked_cash_cents    = locked_cash_cents    - $3,
                     updated_at = now()
                 WHERE account_id = $1
-                  AND status = 'ACTIVE'
-                  AND locked_cash_cents >= $2
+                  AND bucket_id  = $2
+                  AND locked_cash_cents >= $3
                 """,
                 account_id,
+                lock_bucket_id,
                 unlock_cash,
             )
             if account_update != "UPDATE 1":
-                raise RetryableOCCError("account changed concurrently during cancel")
+                raise RetryableOCCError("cash bucket changed concurrently during cancel")
 
             await conn.execute(
                 """

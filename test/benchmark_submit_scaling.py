@@ -169,6 +169,16 @@ async def _create_market(conn: asyncpg.Connection, run_id: str, point_label: str
     return market_id
 
 
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _split_amount(amount_cents: int, n: int) -> list[int]:
+    base, rem = divmod(amount_cents, n)
+    out = [base] * n
+    out[0] += rem
+    return out
+
+
 async def _fund_accounts(conn: asyncpg.Connection, account_ids: list[str], amount_cents: int) -> None:
     if not account_ids:
         return
@@ -182,6 +192,24 @@ async def _fund_accounts(conn: asyncpg.Connection, account_ids: list[str], amoun
         WHERE account_id IN ({account_id_sql})
         """
     )
+    avail_split = _split_amount(int(amount_cents), ACCOUNT_CASH_BUCKETS)
+    for account_id in account_ids:
+        for b in range(ACCOUNT_CASH_BUCKETS):
+            await conn.execute(
+                """
+                INSERT INTO account_cash_buckets (
+                    account_id, bucket_id, available_cash_cents, locked_cash_cents
+                )
+                VALUES ($1, $2, $3, 0)
+                ON CONFLICT (account_id, bucket_id) DO UPDATE
+                SET available_cash_cents = EXCLUDED.available_cash_cents,
+                    locked_cash_cents    = 0,
+                    updated_at = now()
+                """,
+                account_id,
+                b,
+                avail_split[b],
+            )
 
 
 async def _delete_orders_for_markets(conn: asyncpg.Connection, market_ids: list[str]) -> None:
@@ -212,6 +240,9 @@ async def _cleanup(pool: asyncpg.Pool, market_ids: list[str], account_ids: list[
                 async with conn.transaction():
                     await conn.execute(
                         f"DELETE FROM account_auth_sessions WHERE account_id IN ({account_id_sql})",
+                    )
+                    await conn.execute(
+                        f"DELETE FROM account_cash_buckets WHERE account_id IN ({account_id_sql})",
                     )
                     await conn.execute(
                         f"DELETE FROM accounts WHERE account_id IN ({account_id_sql})",

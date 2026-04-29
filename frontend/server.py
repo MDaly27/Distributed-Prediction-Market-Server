@@ -8,6 +8,7 @@ import mimetypes
 import os
 import secrets
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -52,10 +53,44 @@ class FrontendError(Exception):
 
 
 class ListenerClient:
+    _MAX_IDLE_SOCKETS = 16
+    _CONNECT_TIMEOUT_S = 10.0
+
     def __init__(self, host: str, port: int, auth_token: str):
         self.host = host
         self.port = port
         self.auth_token = auth_token
+        self._idle: list[tuple[socket.socket, Any]] = []
+        self._lock = threading.Lock()
+
+    def _checkout(self) -> tuple[socket.socket, Any]:
+        with self._lock:
+            if self._idle:
+                return self._idle.pop()
+        sock = socket.create_connection((self.host, self.port), timeout=self._CONNECT_TIMEOUT_S)
+        sock.settimeout(self._CONNECT_TIMEOUT_S)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        reader = sock.makefile("rb")
+        return sock, reader
+
+    def _release(self, sock: socket.socket, reader: Any, healthy: bool) -> None:
+        if not healthy:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        with self._lock:
+            if len(self._idle) >= self._MAX_IDLE_SOCKETS:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            self._idle.append((sock, reader))
 
     def call(self, action: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
         message = {
@@ -64,19 +99,36 @@ class ListenerClient:
             "request": request or {},
         }
         payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        with socket.create_connection((self.host, self.port), timeout=10) as sock:
-            sock.sendall(payload)
-            reader = sock.makefile("rb")
-            raw = reader.readline()
-        if not raw:
-            raise FrontendError("listener did not respond", HTTPStatus.BAD_GATEWAY)
-        try:
-            response = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise FrontendError("listener returned invalid JSON", HTTPStatus.BAD_GATEWAY) from exc
-        if not response.get("ok"):
-            raise FrontendError(str(response.get("error") or "listener error"), HTTPStatus.BAD_REQUEST)
-        return response
+
+        # On error, retry once with a fresh connection in case the listener
+        # half-closed the pooled socket since we last used it.
+        for attempt in range(2):
+            sock, reader = self._checkout()
+            try:
+                sock.sendall(payload)
+                raw = reader.readline()
+            except (OSError, socket.timeout):
+                self._release(sock, reader, healthy=False)
+                if attempt == 0:
+                    continue
+                raise FrontendError("listener did not respond", HTTPStatus.BAD_GATEWAY)
+
+            if not raw:
+                self._release(sock, reader, healthy=False)
+                if attempt == 0:
+                    continue
+                raise FrontendError("listener did not respond", HTTPStatus.BAD_GATEWAY)
+
+            self._release(sock, reader, healthy=True)
+            try:
+                response = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise FrontendError("listener returned invalid JSON", HTTPStatus.BAD_GATEWAY) from exc
+            if not response.get("ok"):
+                raise FrontendError(str(response.get("error") or "listener error"), HTTPStatus.BAD_REQUEST)
+            return response
+
+        raise FrontendError("listener did not respond", HTTPStatus.BAD_GATEWAY)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -227,6 +279,19 @@ async def _ensure_bootstrap_admin(username: str, password: str, db_dsn: str) -> 
                 password_salt,
                 password_iterations,
             )
+            n_buckets = 16
+            for b in range(n_buckets):
+                await conn.execute(
+                    """
+                    INSERT INTO account_cash_buckets (
+                        account_id, bucket_id, available_cash_cents, locked_cash_cents
+                    )
+                    VALUES ($1, $2, 0, 0)
+                    ON CONFLICT (account_id, bucket_id) DO NOTHING
+                    """,
+                    account_id,
+                    b,
+                )
             return account_id
 
         account_id = str(uuid.uuid4())
@@ -251,6 +316,22 @@ async def _ensure_bootstrap_admin(username: str, password: str, db_dsn: str) -> 
             password_salt,
             password_iterations,
         )
+        n_buckets = 16
+        base, rem = divmod(5000, n_buckets)
+        for b in range(n_buckets):
+            avail = base + (rem if b == 0 else 0)
+            await conn.execute(
+                """
+                INSERT INTO account_cash_buckets (
+                    account_id, bucket_id, available_cash_cents, locked_cash_cents
+                )
+                VALUES ($1, $2, $3, 0)
+                ON CONFLICT (account_id, bucket_id) DO NOTHING
+                """,
+                account_id,
+                b,
+                avail,
+            )
         return account_id
     finally:
         await conn.close()

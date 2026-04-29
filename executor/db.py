@@ -7,6 +7,17 @@ import asyncpg
 from models import SettlementCandidate
 
 
+# Must agree with client/client-listener/db.py ACCOUNT_CASH_BUCKETS.
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _bucket_for_uuid(value: str) -> int:
+    try:
+        return int(uuid.UUID(value).int) % ACCOUNT_CASH_BUCKETS
+    except Exception:
+        return abs(hash(value)) % ACCOUNT_CASH_BUCKETS
+
+
 class ExecutionError(Exception):
     pass
 
@@ -247,15 +258,21 @@ class ExecutionRepository:
                         if not inserted:
                             continue
 
+                        # Bucket keyed by market_id so concurrent settlements
+                        # for different markets target different rows.
+                        payout_bucket = _bucket_for_uuid(market_id)
                         await conn.execute(
                             """
-                            UPDATE accounts
-                            SET available_cash_cents = available_cash_cents + $2,
+                            INSERT INTO account_cash_buckets (
+                                account_id, bucket_id, available_cash_cents, locked_cash_cents
+                            )
+                            VALUES ($1, $2, $3, 0)
+                            ON CONFLICT (account_id, bucket_id) DO UPDATE
+                            SET available_cash_cents = account_cash_buckets.available_cash_cents + EXCLUDED.available_cash_cents,
                                 updated_at = now()
-                            WHERE account_id = $1
-                              AND status = 'ACTIVE'
                             """,
                             account_id,
+                            payout_bucket,
                             payout,
                         )
 

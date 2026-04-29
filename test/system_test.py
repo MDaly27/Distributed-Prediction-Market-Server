@@ -31,6 +31,41 @@ class TestAccount:
     session_token: str
 
 
+# Must agree with the listener / matchmaker / executor ACCOUNT_CASH_BUCKETS.
+ACCOUNT_CASH_BUCKETS = 16
+
+
+def _split_amount(amount_cents: int, n: int) -> list[int]:
+    base, rem = divmod(amount_cents, n)
+    out = [base] * n
+    out[0] += rem
+    return out
+
+
+async def _reseed_account_cash_buckets(
+    conn: asyncpg.Connection, account_id: str, available_cents: int, locked_cents: int = 0
+) -> None:
+    avail_split = _split_amount(available_cents, ACCOUNT_CASH_BUCKETS)
+    locked_split = _split_amount(locked_cents, ACCOUNT_CASH_BUCKETS)
+    for b in range(ACCOUNT_CASH_BUCKETS):
+        await conn.execute(
+            """
+            INSERT INTO account_cash_buckets (
+                account_id, bucket_id, available_cash_cents, locked_cash_cents
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (account_id, bucket_id) DO UPDATE
+            SET available_cash_cents = EXCLUDED.available_cash_cents,
+                locked_cash_cents    = EXCLUDED.locked_cash_cents,
+                updated_at = now()
+            """,
+            account_id,
+            b,
+            avail_split[b],
+            locked_split[b],
+        )
+
+
 def _uuid() -> str:
     return str(uuid.uuid4())
 
@@ -203,8 +238,10 @@ async def _cleanup(conn: asyncpg.Connection, market_ids: list[str], account_ids:
     await conn.execute(f"DELETE FROM orders WHERE market_id IN ({m_ids})")
     await conn.execute(f"DELETE FROM execution_market_leases WHERE market_id IN ({m_ids})")
     await conn.execute(f"DELETE FROM matchmaker_market_leases WHERE market_id IN ({m_ids})")
+    await conn.execute(f"DELETE FROM match_work_queue WHERE market_id IN ({m_ids})")
     await conn.execute(f"DELETE FROM account_auth_sessions WHERE account_id IN ({a_ids})")
     await conn.execute(f"DELETE FROM cash_transactions WHERE account_id IN ({a_ids})")
+    await conn.execute(f"DELETE FROM account_cash_buckets WHERE account_id IN ({a_ids})")
     await conn.execute(f"DELETE FROM markets WHERE market_id IN ({m_ids})")
     await conn.execute(f"DELETE FROM accounts WHERE account_id IN ({a_ids})")
 
@@ -289,6 +326,7 @@ async def _run_test(args: argparse.Namespace) -> None:
                     "UPDATE accounts SET available_cash_cents = 200000, updated_at = now() WHERE account_id = $1",
                     account.account_id,
                 )
+                await _reseed_account_cash_buckets(conn, account.account_id, 200000, 0)
 
         submissions = [
             (args.listener_port_a, _uuid(), accounts["yes"], markets["m1"], "YES", 2, 60),
